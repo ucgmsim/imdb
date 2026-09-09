@@ -487,12 +487,14 @@ class IMDB:
         pd.DataFrame
             Indexed by `record_int_id`, one column per requested period.
         """
-        grid = self.con.table("periods").to_pandas().set_index("period")["period_index"]
+        period_index = (
+            self.con.table("periods").to_pandas().set_index("period")["period_index"]
+        )
         if periods is None:
-            periods = grid.index.tolist()
+            periods = period_index.index.tolist()
         record_int_ids = self.get_records(**filters).index.tolist()
         t = self.con.table("psa_ims").filter(_.record_int_id.isin(record_int_ids))
-        cols = {str(p): t.pSA[int(grid.loc[p]) - 1] for p in periods}
+        cols = {str(p): t.pSA[int(period_index.loc[p]) - 1] for p in periods}
         return (
             t.select(record_int_id=t.record_int_id, **cols)
             .to_pandas()
@@ -516,16 +518,16 @@ class IMDB:
         pd.DataFrame
             Indexed by `record_int_id`, one column per requested frequency.
         """
-        grid = (
+        freq_index = (
             self.con.table("frequencies")
             .to_pandas()
             .set_index("frequency")["freq_index"]
         )
         if frequencies is None:
-            frequencies = grid.index.tolist()
+            frequencies = freq_index.index.tolist()
         record_int_ids = self.get_records(**filters).index.tolist()
         t = self.con.table("fas_ims").filter(_.record_int_id.isin(record_int_ids))
-        cols = {str(f): t.FAS[int(grid.loc[f]) - 1] for f in frequencies}
+        cols = {str(f): t.FAS[int(freq_index.loc[f]) - 1] for f in frequencies}
         return (
             t.select(record_int_id=t.record_int_id, **cols)
             .to_pandas()
