@@ -67,13 +67,13 @@ def db(tmp_path):
                 "rel_id": [r[0] for r in rows],
                 "site_id": [r[1] for r in rows],
                 "component": [r[2] for r in rows],
-                "pSA": [rng.uniform(size=len(PERIODS)) for _ in range(n)],
-                "FAS": [rng.uniform(size=len(FREQUENCIES)) for _ in range(n)],
                 "PGA": rng.uniform(size=n),
                 "PGV": rng.uniform(size=n),
                 "PGD": rng.uniform(size=n),
             }
-        )
+        ),
+        pSA=rng.uniform(size=(n, len(PERIODS))),
+        FAS=rng.uniform(size=(n, len(FREQUENCIES))),
     )
     yield db
     db.close()

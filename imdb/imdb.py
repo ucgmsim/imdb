@@ -49,6 +49,12 @@ class IMDB:
             self._con = ibis.duckdb.connect(self.path, read_only=self.read_only)
         return self
 
+    @property
+    def db_meta(self) -> dict[str, str]:
+        """The `db_meta` table, as a dict."""
+        df = self.con.table("db_meta").to_pandas()
+        return dict(zip(df["key"], df["value"], strict=True))
+
     def close(self) -> None:
         """Close the database connection."""
         if self._con is not None:
@@ -62,8 +68,6 @@ class IMDB:
     def __exit__(self, *exc: object) -> None:
         """Close the database connection."""
         self.close()
-
-    # ---- create -------------------------------------------------------
 
     @classmethod
     def create(
@@ -138,8 +142,6 @@ class IMDB:
         )
         return db
 
-    # ---- write helpers --------------------------------------------------
-
     def _next_ids(self, table: str, int_col: str, n: int) -> np.ndarray:
         """Return `n` new contiguous integer ids for `table`, starting after the current max."""
         current = self.con.table(table)[int_col].max().to_pandas()
@@ -150,8 +152,6 @@ class IMDB:
         """Return a `pd.Series` mapping string id to int id for `table`."""
         df = self.con.table(table).select(id_col, int_col).to_pandas()
         return df.set_index(id_col)[int_col]
-
-    # ---- write ----------------------------------------------------------
 
     def add_events(self, df: pd.DataFrame) -> None:
         """Insert new events.
@@ -210,48 +210,49 @@ class IMDB:
         df = df.drop(columns=["site_id", "event_id"])
         self.con.insert("site_event", df)
 
-    ## TODO: CHange this to take a record_df (containing rel_id, site_id, component) + scalar IM columns, 
-    # plus optional pSA and FAS numpy arrays. Update logic accordingly
-    def add_records(self, df: pd.DataFrame) -> np.ndarray:
+    def add_records(
+        self,
+        df: pd.DataFrame,
+        pSA: np.ndarray | None = None,  # noqa: N803
+        FAS: np.ndarray | None = None,  # noqa: N803
+    ) -> np.ndarray:
         """Insert new records, and whichever IM tables the input covers.
 
-        A row with a missing (`None`) `pSA` or `FAS` array is not written to that IM
+        A record whose `pSA`/`FAS` row is entirely NaN is not written to that IM
         table at all, matching the schema's row-presence-means-coverage convention.
 
         Parameters
         ----------
         df : pd.DataFrame
-            Must have `rel_id`, `site_id` and `component` columns. May also have a
-            `pSA` column (list of float, one per period), a `FAS` column (list of
-            float, one per frequency), and any of the scalar IM columns
-            (`schema.SCALAR_IMS`).
+            Must have `rel_id`, `site_id` and `component` columns, one row per
+            record. May also have any of the scalar IM columns (`schema.SCALAR_IMS`).
+        pSA : np.ndarray, optional
+            Shape `(len(df), n_periods)`. A row of all NaN means that record has
+            no pSA.
+        FAS : np.ndarray, optional
+            Shape `(len(df), n_frequencies)`. A row of all NaN means that record
+            has no FAS.
 
         Returns
         -------
         np.ndarray
-            The `record_id` assigned to each input row, in input order.
+            The `record_id` assigned to each row of `df`, in input order.
         """
         df = df.copy()
-
-        ## TODO: I think this should be a property?
-        components = set(
-            self.con.table("db_meta")
-            .filter(_.key == "components")
-            .to_pandas()["value"]
-            .iloc[0]
-            .split(",")
-        )
-        unknown = set(df["component"]) - components
+        unknown = set(df["component"]) - set(self.db_meta["components"].split(","))
         if unknown:
             raise ValueError(f"components not in this database: {sorted(unknown)}")
 
-        rel_int_id = self._id_map("realisations", "rel_id", "rel_int_id")
-        rel_event_int_id = self._id_map("realisations", "rel_int_id", "event_int_id")
-        site_int_id = self._id_map("sites", "site_id", "site_int_id")
+        assert pSA is None or pSA.shape[0] == len(df), "pSA must have one row per record"
+        assert FAS is None or FAS.shape[0] == len(df), "FAS must have one row per record"
 
-        df["rel_int_id"] = rel_int_id.loc[df["rel_id"]].to_numpy()
-        df["site_int_id"] = site_int_id.loc[df["site_id"]].to_numpy()
-        df["event_int_id"] = rel_event_int_id.loc[df["rel_int_id"]].to_numpy()
+        rel_int_id_mapping = self._id_map("realisations", "rel_id", "rel_int_id")
+        rel_event_int_id_mapping = self._id_map("realisations", "rel_int_id", "event_int_id")
+        site_int_id_mapping = self._id_map("sites", "site_id", "site_int_id")
+
+        df["rel_int_id"] = rel_int_id_mapping.loc[df["rel_id"]].to_numpy()
+        df["site_int_id"] = site_int_id_mapping.loc[df["site_id"]].to_numpy()
+        df["event_int_id"] = rel_event_int_id_mapping.loc[df["rel_int_id"]].to_numpy()
         record_id = (
             self.con.raw_sql(f"SELECT nextval('record_id_seq') FROM range({len(df)})")
             .df()["nextval('record_id_seq')"]
@@ -273,13 +274,22 @@ class IMDB:
                     ]
                 ],
             )
-            if "pSA" in df:
-                # Why not just 
-                mask = df["pSA"].apply(lambda x: x is not None)
-                self.con.insert("psa_ims", df.loc[mask, ["record_id", "pSA"]])
-            if "FAS" in df:
-                mask = df["FAS"].apply(lambda x: x is not None)
-                self.con.insert("fas_ims", df.loc[mask, ["record_id", "FAS"]])
+            if pSA is not None:
+                mask = ~np.isnan(pSA).all(axis=1)
+                self.con.insert(
+                    "psa_ims",
+                    pd.DataFrame(
+                        {"record_id": record_id[mask], "pSA": list(pSA[mask])}
+                    ),
+                )
+            if FAS is not None:
+                mask = ~np.isnan(FAS).all(axis=1)
+                self.con.insert(
+                    "fas_ims",
+                    pd.DataFrame(
+                        {"record_id": record_id[mask], "FAS": list(FAS[mask])}
+                    ),
+                )
             scalar_cols = [c for c in schema.SCALAR_IMS if c in df]
             if scalar_cols:
                 scalars = df[["record_id", *scalar_cols]].copy()
@@ -315,9 +325,8 @@ class IMDB:
         for statement in statements:
             self.con.raw_sql(statement, parameters=[event_id])
 
-    ## TODO: Simplify, it should just check for basic stuff, e.g. that all integer ids are unique, fks are valid. Keep it simple.
     def validate(self) -> list[str]:
-        """Check the invariants the schema itself cannot enforce.
+        """Check the invariants the schema itself cannot enforce: unique ids, valid FKs.
 
         Returns
         -------
@@ -325,37 +334,25 @@ class IMDB:
             One entry per problem found; empty if the database is consistent.
         """
         problems = []
-        records = self.con.table("records")
-        n_periods = len(self.con.table("periods").to_pandas())
-        n_frequencies = len(self.con.table("frequencies").to_pandas())
+        for table in ("records", "psa_ims", "fas_ims", "scalars_ims"):
+            t = self.con.table(table)
+            n_rows = t.count().to_pandas()
+            n_unique = t.record_id.nunique().to_pandas()
+            if n_rows != n_unique:
+                problems.append(
+                    f"{table}: record_id is not unique ({n_rows} rows, {n_unique} unique)"
+                )
 
-        orphans = {
+        records = self.con.table("records")
+        fks = {
             "rel_int_id": self.con.table("realisations").rel_int_id,
             "site_int_id": self.con.table("sites").site_int_id,
             "event_int_id": self.con.table("events").event_int_id,
         }
-        for col, valid in orphans.items():
+        for col, valid in fks.items():
             n = records.filter(~records[col].isin(valid)).count().to_pandas()
             if n:
                 problems.append(f"records: {n} rows with an unknown {col}")
-
-        n = (
-            self.con.table("psa_ims")
-            .filter(_.pSA.length() != n_periods)
-            .count()
-            .to_pandas()
-        )
-        if n:
-            problems.append(f"psa_ims: {n} rows with pSA length != {n_periods}")
-
-        n = (
-            self.con.table("fas_ims")
-            .filter(_.FAS.length() != n_frequencies)
-            .count()
-            .to_pandas()
-        )
-        if n:
-            problems.append(f"fas_ims: {n} rows with FAS length != {n_frequencies}")
 
         return problems
 
@@ -457,8 +454,8 @@ class IMDB:
         if component is not None:
             t = t.filter(t.component == component)
         if record_ids is not None:
-            ## QUESTION: How performant is this for a large number of record_ids? I previously had issues with ISIN (SQL) queries being slow.
-            t = t.filter(t.record_id.isin(record_ids))
+            ids = ibis.memtable({"record_id": list(record_ids)})
+            t = t.semi_join(ids, "record_id")
         return (
             t.select("record_id", "event_id", "rel_id", "site_id", "component")
             .to_pandas()
