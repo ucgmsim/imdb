@@ -1,117 +1,79 @@
+"""Shared fixtures: one small synthetic IMDB."""
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from imdb import IMDB
 
-PERIODS = [0.01, 0.1, 1.0, 3.0, 10.0]
-FREQUENCIES = [0.1, 1.0, 10.0]
-COMPONENTS = ["geom", "rotd50"]
-EVENTS = ["ev1", "ev2"]
-SITES = ["stnA", "stnB", "stnC"]
-SCALARS = ["PGA", "PGV", "PGD", "CAV", "AI", "Ds575", "Ds595"]
-
-
-def build_frames():
-    """Deterministic input frames covering every table."""
-    events = pd.DataFrame(
-        {
-            "event_id": EVENTS,
-            "magnitude": [7.1, 6.2],
-            "tect_type": ["SUBDUCTION_SLAB", "ACTIVE_SHALLOW"],
-            "dtop": [30.0, 0.5],
-            "metadata": [
-                {"fault_type": "DS_POINT_SOURCE"},
-                {"fault_type": "NORMAL_FAULTING"},
-            ],
-        }
-    )
-    rels = pd.DataFrame(
-        {
-            "rel_id": [f"{e}_REL{i:02d}" for e in EVENTS for i in (1, 2)],
-            "event_id": [e for e in EVENTS for _ in (1, 2)],
-            "magnitude": [7.1, 7.12, 6.2, 6.18],
-            "rake": [90.0, 88.0, -90.0, -92.0],
-            "hypo_lat": [-43.5, -43.6, -41.2, -41.3],
-            "hypo_lon": [172.6, 172.7, 174.8, 174.9],
-            "hypo_depth": [40.0, 42.0, 8.0, 9.0],
-            "metadata": [{"solver": "emod3d"}] * 4,
-        }
-    )
-    sites = pd.DataFrame(
-        {
-            "site_id": SITES,
-            "lat": [-43.5, -43.6, -41.3],
-            "lon": [172.6, 172.7, 174.8],
-            "vs30": [300.0, 500.0, 250.0],
-            "z1p0": [0.3, 0.1, 0.5],
-            "metadata": [{"elevation": 10.0}, {"elevation": 55.0}, {"elevation": 3.0}],
-        }
-    )
-    site_event = pd.DataFrame(
-        {
-            "site_id": [s for s in SITES for _ in EVENTS],
-            "event_id": EVENTS * len(SITES),
-            "rrup": [10.0, 300.0, 25.0, 280.0, 400.0, 5.0],
-            "rjb": [8.0, 295.0, 22.0, 275.0, 395.0, 3.0],
-        }
-    )
-
-    rows = []
-    for rel_id in rels["rel_id"]:
-        for site_id in SITES:
-            for component in COMPONENTS:
-                base = float(len(rows) + 1)
-                row = {
-                    "rel_id": rel_id,
-                    "site_id": site_id,
-                    "component": component,
-                    "pSA": np.array(
-                        [base + i / 8 for i in range(1, len(PERIODS) + 1)],
-                        dtype=np.float32,
-                    ),
-                    "FAS": np.array(
-                        [base * 2 + i / 8 for i in range(1, len(FREQUENCIES) + 1)],
-                        dtype=np.float32,
-                    ),
-                }
-                for k, im in enumerate(SCALARS):
-                    row[im] = base + (k + 1) / 16
-                rows.append(row)
-    records = pd.DataFrame(rows)
-    return events, rels, sites, site_event, records
+PERIODS = [0.1, 0.2, 0.5, 1.0, 2.0]
+FREQUENCIES = [1.0, 5.0, 10.0]
+COMPONENTS = ["000", "090"]
+EVENTS = ["eventA", "eventB"]
+SITES = ["siteA", "siteB", "siteC"]
 
 
 @pytest.fixture
-def db_path(tmp_path):
-    """Path of a small, fully populated database."""
-    path = tmp_path / "test_ims.duckdb"
-    events, rels, sites, site_event, records = build_frames()
-    with IMDB.create(
-        path,
-        periods=PERIODS,
-        frequencies=FREQUENCIES,
-        components=COMPONENTS,
-        db_meta={"dataset_description": "test fixture", "source": "conftest"},
-    ) as db:
-        db.add_events(events)
-        db.add_realisations(rels)
-        db.add_sites(sites)
-        db.add_site_event(site_event)
-        db.add_records(records)
-        db.finalise()
-    return path
+def db(tmp_path):
+    """A small, fully populated IMDB: 2 events, 2 realisations each, 3 sites, 2 components."""
+    path = tmp_path / "test.duckdb"
+    db = IMDB.create(
+        path, periods=PERIODS, frequencies=FREQUENCIES, components=COMPONENTS
+    )
 
+    db.add_events(pd.DataFrame({"event_id": EVENTS, "magnitude": [6.0, 7.0]}))
 
-@pytest.fixture
-def db(db_path):
-    """The fixture database, open read-only."""
-    with IMDB(db_path) as handle:
-        yield handle
+    rel_ids = [f"{e}_rel{i}" for e in EVENTS for i in range(2)]
+    db.add_realisations(
+        pd.DataFrame(
+            {
+                "rel_id": rel_ids,
+                "event_id": [e for e in EVENTS for _ in range(2)],
+            }
+        )
+    )
 
+    db.add_sites(
+        pd.DataFrame(
+            {
+                "site_id": SITES,
+                "lat": [-43.5, -43.6, -43.7],
+                "lon": [172.6, 172.7, 172.8],
+            }
+        )
+    )
 
-@pytest.fixture
-def wdb(db_path):
-    """The fixture database, open for writing."""
-    with IMDB(db_path, read_only=False) as handle:
-        yield handle
+    db.add_site_event(
+        pd.DataFrame(
+            {
+                "site_id": [s for _ in EVENTS for s in SITES],
+                "event_id": [e for e in EVENTS for _ in SITES],
+                "rrup": np.arange(len(EVENTS) * len(SITES), dtype=float),
+            }
+        )
+    )
+
+    rng = np.random.default_rng(0)
+    rows = [
+        (rel_id, site_id, component)
+        for rel_id in rel_ids
+        for site_id in SITES
+        for component in COMPONENTS
+    ]
+    n = len(rows)
+    db.add_records(
+        pd.DataFrame(
+            {
+                "rel_id": [r[0] for r in rows],
+                "site_id": [r[1] for r in rows],
+                "component": [r[2] for r in rows],
+                "pSA": [rng.uniform(size=len(PERIODS)) for _ in range(n)],
+                "FAS": [rng.uniform(size=len(FREQUENCIES)) for _ in range(n)],
+                "PGA": rng.uniform(size=n),
+                "PGV": rng.uniform(size=n),
+                "PGD": rng.uniform(size=n),
+            }
+        )
+    )
+    yield db
+    db.close()

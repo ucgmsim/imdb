@@ -1,4 +1,4 @@
-"""Reading and writing intensity measure databases."""
+"""A library for reading and writing intensity measure databases."""
 
 from imdb.imdb import IMDB
 
