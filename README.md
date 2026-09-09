@@ -1,6 +1,6 @@
 # imdb
 
-A library for reading and writing intensity measure databases (IMDBs) — DuckDB
+A library for reading and writing intensity measure databases (IMDBs), DuckDB
 databases of simulated ground-motion intensity measures. Schema is documented in
 `imdb/schema.py`.
 

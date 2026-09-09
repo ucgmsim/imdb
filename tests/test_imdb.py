@@ -1,7 +1,10 @@
 """Basic tests: the library works for its intended, correct usage."""
 
+import ibis
 import pandas as pd
+import pytest
 
+from imdb import IMDB
 from tests.conftest import COMPONENTS, EVENTS, FREQUENCIES, PERIODS, SITES
 
 
@@ -37,6 +40,10 @@ def test_delete_and_readd(db):
     assert len(db.get_records(event_ids=["eventA"])) == 0
     assert len(db.get_realisations()) == 2
     assert db.validate() == []
+    assert "eventA" not in db.get_events().index
+
+    db.add_events(pd.DataFrame({"event_id": ["eventA"], "magnitude": [6.0]}))
+    assert "eventA" in db.get_events().index
 
 
 def test_gmm_records(db):
@@ -66,3 +73,33 @@ def test_gmm_records(db):
 
     simulated_records = db.get_records(kind="simulated")
     assert (simulated_records["gmm_key"].isna()).all()
+
+
+def test_schema_version_mismatch_rejected(db):
+    path = db.path
+    db.close()
+
+    con = ibis.duckdb.connect(path, read_only=False)
+    con.raw_sql("UPDATE db_meta SET value = 'stale' WHERE key = 'schema_version'")
+    con.disconnect()
+
+    with pytest.raises(RuntimeError, match="schema version"):
+        IMDB(path, read_only=True).open()
+
+
+def test_validate_catches_sigma_on_non_gmm_record(db):
+    db.add_records(
+        pd.DataFrame(
+            {
+                "rel_id": ["eventA_rel0"],
+                "site_id": ["siteA"],
+                "component": ["000"],
+                "kind": ["simulated"],
+                "PGA": [0.5],
+                "PGA_sigma": [0.6],
+            }
+        )
+    )
+
+    problems = db.validate()
+    assert any("scalars_ims.PGA_sigma" in p for p in problems)

@@ -4,7 +4,7 @@ Facts only, no logic. `DDL` is the single source of truth for the schema; nothin
 else in this library composes column lists by hand.
 """
 
-SCHEMA_VERSION = "0"
+SCHEMA_VERSION = "1"
 
 DDL = """
 CREATE TABLE db_meta  (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL);

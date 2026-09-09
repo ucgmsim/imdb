@@ -67,6 +67,7 @@ def db(tmp_path):
                 "rel_id": [r[0] for r in rows],
                 "site_id": [r[1] for r in rows],
                 "component": [r[2] for r in rows],
+                "kind": "simulated",
                 "PGA": rng.uniform(size=n),
                 "PGV": rng.uniform(size=n),
                 "PGD": rng.uniform(size=n),

@@ -47,6 +47,15 @@ class IMDB:
         """Open the database connection, if not already open."""
         if self._con is None:
             self._con = ibis.duckdb.connect(self.path, read_only=self.read_only)
+            if "db_meta" in self._con.list_tables():
+                found = self.db_meta.get("schema_version")
+                if found != schema.SCHEMA_VERSION:
+                    self.close()
+                    raise RuntimeError(
+                        f"database schema version {found!r} does not match "
+                        f"this imdb version's {schema.SCHEMA_VERSION!r}; "
+                        "the database needs rebuilding with a matching imdb version"
+                    )
         return self
 
     @property
@@ -226,11 +235,10 @@ class IMDB:
         Parameters
         ----------
         df : pd.DataFrame
-            Must have `rel_id`, `site_id` and `component` columns, one row per
-            record. May also have a `kind` column (default `"simulated"`), a
-            `gmm_key` column (default `NULL`, only meaningful for `kind="gmm"`),
-            any of the scalar IM columns (`schema.SCALAR_IMS`), and their paired
-            `<IM>_sigma` columns.
+            Must have `rel_id`, `site_id`, `component` and `kind` columns, one
+            row per record. May also have a `gmm_key` column (default `NULL`,
+            only meaningful for `kind="gmm"`), any of the scalar IM columns
+            (`schema.SCALAR_IMS`), and their paired `<IM>_sigma` columns.
         pSA : np.ndarray, optional
             Shape `(len(df), n_periods)`. A row of all NaN means that record has
             no pSA.
@@ -251,9 +259,10 @@ class IMDB:
         """
         df = df.copy()
 
-        ## TODO: Make kind a required function argument.
         if "kind" not in df:
-            df["kind"] = "simulated"
+            raise ValueError(
+                "df must have a 'kind' column ('simulated', 'gmm' or 'observed')"
+            )
         if "gmm_key" not in df:
             df["gmm_key"] = None
 
@@ -261,18 +270,18 @@ class IMDB:
         if unknown:
             raise ValueError(f"components not in this database: {sorted(unknown)}")
 
-        assert pSA is None or pSA.shape[0] == len(df), (
-            "pSA must have one row per record"
-        )
-        assert FAS is None or FAS.shape[0] == len(df), (
-            "FAS must have one row per record"
-        )
-        assert pSA_sigma is None or (pSA is not None and pSA_sigma.shape == pSA.shape), (
-            "pSA_sigma must match pSA's shape, and only be given together with pSA"
-        )
-        assert FAS_sigma is None or (FAS is not None and FAS_sigma.shape == FAS.shape), (
-            "FAS_sigma must match FAS's shape, and only be given together with FAS"
-        )
+        if pSA is not None and pSA.shape[0] != len(df):
+            raise ValueError("pSA must have one row per record")
+        if FAS is not None and FAS.shape[0] != len(df):
+            raise ValueError("FAS must have one row per record")
+        if pSA_sigma is not None and not (pSA is not None and pSA_sigma.shape == pSA.shape):
+            raise ValueError(
+                "pSA_sigma must match pSA's shape, and only be given together with pSA"
+            )
+        if FAS_sigma is not None and not (FAS is not None and FAS_sigma.shape == FAS.shape):
+            raise ValueError(
+                "FAS_sigma must match FAS's shape, and only be given together with FAS"
+            )
 
         rel_int_id_mapping = self._id_map("realisations", "rel_id", "rel_int_id")
         rel_event_int_id_mapping = self._id_map(
@@ -360,6 +369,8 @@ class IMDB:
             f"DELETE FROM records WHERE event_int_id = {event_int_id_subquery}",
             f"DELETE FROM site_event WHERE event_int_id = {event_int_id_subquery}",
             f"DELETE FROM realisations WHERE event_int_id = {event_int_id_subquery}",
+            ##  QUESTION:Why is this one a different style than the other deletes? Why not f string?
+            "DELETE FROM events WHERE event_id = ?",
         ]
         for statement in statements:
             self.con.raw_sql(statement, parameters=[event_id])
@@ -393,6 +404,12 @@ class IMDB:
             if n:
                 problems.append(f"records: {n} rows with an unknown {col}")
 
+        for table in ("psa_ims", "fas_ims", "scalars_ims"):
+            t = self.con.table(table)
+            n = t.filter(~t.record_int_id.isin(records.record_int_id)).count().to_pandas()
+            if n:
+                problems.append(f"{table}: {n} rows with an unknown record_int_id")
+
         bad_gmm_key = (
             records.filter(
                 ((records.kind == "gmm") & records.gmm_key.isnull())
@@ -405,6 +422,22 @@ class IMDB:
             problems.append(
                 f"records: {bad_gmm_key} rows with gmm_key inconsistent with kind"
             )
+
+        kind_by_record = records.select("record_int_id", "kind")
+        sigma_cols = [
+            ("psa_ims", "pSA_sigma"),
+            ("fas_ims", "FAS_sigma"),
+            *[("scalars_ims", f"{im}_sigma") for im in schema.SCALAR_IMS],
+        ]
+        for table, col in sigma_cols:
+            joined = self.con.table(table).join(kind_by_record, "record_int_id")
+            n = (
+                joined.filter((joined.kind != "gmm") & joined[col].notnull())
+                .count()
+                .to_pandas()
+            )
+            if n:
+                problems.append(f"{table}.{col}: {n} rows populated for kind != 'gmm'")
 
         return problems
 
