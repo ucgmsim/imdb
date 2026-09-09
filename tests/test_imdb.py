@@ -1,6 +1,7 @@
 """Basic tests: the library works for its intended, correct usage."""
 
 import ibis
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -103,3 +104,55 @@ def test_validate_catches_sigma_on_non_gmm_record(db):
 
     problems = db.validate()
     assert any("scalars_ims.PGA_sigma" in p for p in problems)
+
+
+def test_all_nan_row_not_written_to_psa(db):
+    record_int_ids = db.add_records(
+        pd.DataFrame(
+            {
+                "rel_id": ["eventA_rel0", "eventA_rel0"],
+                "site_id": ["siteA", "siteB"],
+                "component": ["000", "000"],
+                "kind": ["simulated", "simulated"],
+            }
+        ),
+        pSA=np.array([[1.0] * len(PERIODS), [np.nan] * len(PERIODS)]),
+    )
+
+    psa = db.get_psa(record_int_ids=list(record_int_ids))
+    assert list(psa.index) == [record_int_ids[0]]
+
+
+def test_get_site_event_filters(db):
+    by_event = db.get_site_event(event_ids=["eventA"])
+    assert (by_event["event_id"] == "eventA").all()
+    assert len(by_event) == len(SITES)
+
+    by_rrup = db.get_site_event(max_rrup=1.5)
+    assert (by_rrup["rrup"] <= 1.5).all()
+    assert len(by_rrup) == 2
+
+
+def test_rotd_component_nulls_undefined_scalars(tmp_path):
+    db = IMDB.create(tmp_path / "rotd.duckdb", periods=[], components=("rotd50",))
+    db.add_events(pd.DataFrame({"event_id": ["e1"]}))
+    db.add_realisations(pd.DataFrame({"rel_id": ["r1"], "event_id": ["e1"]}))
+    db.add_sites(pd.DataFrame({"site_id": ["s1"], "lat": [-43.5], "lon": [172.6]}))
+
+    db.add_records(
+        pd.DataFrame(
+            {
+                "rel_id": ["r1"],
+                "site_id": ["s1"],
+                "component": ["rotd50"],
+                "kind": ["simulated"],
+                "PGA": [0.5],
+                "CAV": [1.2],
+            }
+        )
+    )
+
+    scalars = db.get_scalars(ims=["PGA", "CAV"])
+    assert scalars["PGA"].iloc[0] == 0.5
+    assert pd.isna(scalars["CAV"].iloc[0])
+    db.close()
