@@ -25,6 +25,8 @@ CREATE TYPE tect_type_t AS ENUM (
     'ACTIVE_SHALLOW', 'VOLCANIC', 'SUBDUCTION_INTERFACE', 'SUBDUCTION_SLAB'
 );
 
+CREATE TYPE record_kind_t AS ENUM ('simulated', 'gmm', 'observed');
+
 CREATE TABLE events (
     event_int_id INTEGER PRIMARY KEY,
     event_id     VARCHAR NOT NULL UNIQUE,
@@ -81,21 +83,30 @@ CREATE TABLE records (
     event_int_id  INTEGER NOT NULL,
     rel_int_id    INTEGER NOT NULL,
     site_int_id   INTEGER NOT NULL,
-    component     VARCHAR NOT NULL
+    component     VARCHAR NOT NULL,
+    kind          record_kind_t NOT NULL DEFAULT 'simulated',
+    gmm_key       VARCHAR
 );
 
-CREATE TABLE psa_ims (record_int_id BIGINT NOT NULL, pSA FLOAT[]);
-CREATE TABLE fas_ims (record_int_id BIGINT NOT NULL, FAS FLOAT[]);
+CREATE TABLE psa_ims (record_int_id BIGINT NOT NULL, pSA FLOAT[], pSA_sigma FLOAT[]);
+CREATE TABLE fas_ims (record_int_id BIGINT NOT NULL, FAS FLOAT[], FAS_sigma FLOAT[]);
 
 CREATE TABLE scalars_ims (
     record_int_id BIGINT NOT NULL,
-    PGA       FLOAT,
-    PGV       FLOAT,
-    PGD       FLOAT,
-    CAV       FLOAT,
-    AI        FLOAT,
-    Ds575     FLOAT,
-    Ds595     FLOAT
+    PGA           FLOAT,
+    PGA_sigma     FLOAT,
+    PGV           FLOAT,
+    PGV_sigma     FLOAT,
+    PGD           FLOAT,
+    PGD_sigma     FLOAT,
+    CAV           FLOAT,
+    CAV_sigma     FLOAT,
+    AI            FLOAT,
+    AI_sigma      FLOAT,
+    Ds575         FLOAT,
+    Ds575_sigma   FLOAT,
+    Ds595         FLOAT,
+    Ds595_sigma   FLOAT
 );
 """
 
@@ -129,8 +140,16 @@ METADATA_TABLES = {
 NOTES = {
     "logical keys": (
         "site_event's logical key is (site_int_id, event_int_id); records' logical key is "
-        "(rel_int_id, site_int_id, component). Neither is enforced by a constraint; the "
-        "writer is responsible for not creating duplicates."
+        "(rel_int_id, site_int_id, component, kind, gmm_key). Neither is enforced by a "
+        "constraint; the writer is responsible for not creating duplicates."
+    ),
+    "record kind": (
+        "records.kind is 'simulated' (physics-based simulation), 'gmm' (empirical "
+        "ground-motion model prediction) or 'observed' (real recorded ground motion). "
+        "gmm_key identifies the model, e.g. 'Bradley_2013'; NULL unless kind = 'gmm', and "
+        "not validated against a fixed vocabulary. A gmm/observed record still needs a "
+        "rel_int_id: for a fault with no per-realisation concept, that is the event's "
+        "synthetic realisation."
     ),
     "array indexing is 1-based": (
         "periods.period_index and frequencies.freq_index are 1-based, matching DuckDB list "
@@ -141,7 +160,7 @@ NOTES = {
         "event_id, rel_id and site_id are stable. The integer surrogates event_int_id, "
         "rel_int_id, site_int_id and record_int_id are assigned at ingest and change on rebuild; "
         "nothing outside the database may reference them. External references use "
-        "(rel_id, site_id, component)."
+        "(rel_id, site_id, component, kind, gmm_key)."
     ),
     "component vocabulary": (
         "000, 090, ver, geom, rotd0, rotd50, rotd100, following IM_calculation. A database "
@@ -155,7 +174,10 @@ NOTES = {
     "units": (
         "Linear, physical units; log is a read-time transform. Every IM unit is a row in "
         "im_units. Outside the IM tables: distances km, vs30 m/s, z1p0 and z2p5 km, depths "
-        "km, angles degrees, coordinates WGS84."
+        "km, angles degrees, coordinates WGS84. Every *_sigma column/array is the "
+        "exception: a ln-space (natural-log) total standard deviation, dimensionless, not "
+        "the linear physical unit of its paired IM column. Populated for kind = 'gmm', "
+        "NULL for 'simulated'/'observed'."
     ),
     "metadata columns are JSON": (
         "events, realisations, sites and site_event each carry a metadata VARCHAR holding a "

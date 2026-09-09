@@ -215,6 +215,8 @@ class IMDB:
         df: pd.DataFrame,
         pSA: np.ndarray | None = None,  # noqa: N803
         FAS: np.ndarray | None = None,  # noqa: N803
+        pSA_sigma: np.ndarray | None = None,  # noqa: N803
+        FAS_sigma: np.ndarray | None = None,  # noqa: N803
     ) -> np.ndarray:
         """Insert new records, and whichever IM tables the input covers.
 
@@ -225,13 +227,22 @@ class IMDB:
         ----------
         df : pd.DataFrame
             Must have `rel_id`, `site_id` and `component` columns, one row per
-            record. May also have any of the scalar IM columns (`schema.SCALAR_IMS`).
+            record. May also have a `kind` column (default `"simulated"`), a
+            `gmm_key` column (default `NULL`, only meaningful for `kind="gmm"`),
+            any of the scalar IM columns (`schema.SCALAR_IMS`), and their paired
+            `<IM>_sigma` columns.
         pSA : np.ndarray, optional
             Shape `(len(df), n_periods)`. A row of all NaN means that record has
             no pSA.
         FAS : np.ndarray, optional
             Shape `(len(df), n_frequencies)`. A row of all NaN means that record
             has no FAS.
+        pSA_sigma : np.ndarray, optional
+            Shape `(len(df), n_periods)`, ln-space total sigma paired with `pSA`.
+            Only valid together with `pSA`.
+        FAS_sigma : np.ndarray, optional
+            Shape `(len(df), n_frequencies)`, ln-space total sigma paired with
+            `FAS`. Only valid together with `FAS`.
 
         Returns
         -------
@@ -239,6 +250,13 @@ class IMDB:
             The `record_int_id` assigned to each row of `df`, in input order.
         """
         df = df.copy()
+
+        ## TODO: Make kind a required function argument.
+        if "kind" not in df:
+            df["kind"] = "simulated"
+        if "gmm_key" not in df:
+            df["gmm_key"] = None
+
         unknown = set(df["component"]) - set(self.db_meta["components"].split(","))
         if unknown:
             raise ValueError(f"components not in this database: {sorted(unknown)}")
@@ -248,6 +266,12 @@ class IMDB:
         )
         assert FAS is None or FAS.shape[0] == len(df), (
             "FAS must have one row per record"
+        )
+        assert pSA_sigma is None or (pSA is not None and pSA_sigma.shape == pSA.shape), (
+            "pSA_sigma must match pSA's shape, and only be given together with pSA"
+        )
+        assert FAS_sigma is None or (FAS is not None and FAS_sigma.shape == FAS.shape), (
+            "FAS_sigma must match FAS's shape, and only be given together with FAS"
         )
 
         rel_int_id_mapping = self._id_map("realisations", "rel_id", "rel_int_id")
@@ -279,31 +303,38 @@ class IMDB:
                         "rel_int_id",
                         "site_int_id",
                         "component",
+                        "kind",
+                        "gmm_key",
                     ]
                 ],
             )
             if pSA is not None:
                 mask = ~np.isnan(pSA).all(axis=1)
-                self.con.insert(
-                    "psa_ims",
-                    pd.DataFrame(
-                        {"record_int_id": record_int_id[mask], "pSA": list(pSA[mask])}
-                    ),
+                psa_df = pd.DataFrame(
+                    {"record_int_id": record_int_id[mask], "pSA": list(pSA[mask])}
                 )
+                psa_df["pSA_sigma"] = (
+                    list(pSA_sigma[mask]) if pSA_sigma is not None else None
+                )
+                self.con.insert("psa_ims", psa_df)
             if FAS is not None:
                 mask = ~np.isnan(FAS).all(axis=1)
-                self.con.insert(
-                    "fas_ims",
-                    pd.DataFrame(
-                        {"record_int_id": record_int_id[mask], "FAS": list(FAS[mask])}
-                    ),
+                fas_df = pd.DataFrame(
+                    {"record_int_id": record_int_id[mask], "FAS": list(FAS[mask])}
                 )
+                fas_df["FAS_sigma"] = (
+                    list(FAS_sigma[mask]) if FAS_sigma is not None else None
+                )
+                self.con.insert("fas_ims", fas_df)
             scalar_cols = [c for c in schema.SCALAR_IMS if c in df]
+            sigma_cols = [f"{c}_sigma" for c in scalar_cols if f"{c}_sigma" in df]
             if scalar_cols:
-                scalars = df[["record_int_id", *scalar_cols]].copy()
+                scalars = df[["record_int_id", *scalar_cols, *sigma_cols]].copy()
                 rotd = df["component"].str.startswith("rotd")
                 for col in schema.ROTD_UNDEFINED & set(scalar_cols):
                     scalars.loc[rotd, col] = None
+                    if f"{col}_sigma" in scalars:
+                        scalars.loc[rotd, f"{col}_sigma"] = None
                 self.con.insert("scalars_ims", scalars)
         except Exception:
             self.con.raw_sql("ROLLBACK")
@@ -361,6 +392,19 @@ class IMDB:
             n = records.filter(~records[col].isin(valid)).count().to_pandas()
             if n:
                 problems.append(f"records: {n} rows with an unknown {col}")
+
+        bad_gmm_key = (
+            records.filter(
+                ((records.kind == "gmm") & records.gmm_key.isnull())
+                | ((records.kind != "gmm") & records.gmm_key.notnull())
+            )
+            .count()
+            .to_pandas()
+        )
+        if bad_gmm_key:
+            problems.append(
+                f"records: {bad_gmm_key} rows with gmm_key inconsistent with kind"
+            )
 
         return problems
 
@@ -421,6 +465,8 @@ class IMDB:
         rel_ids: list[str] | None = None,
         site_ids: list[str] | None = None,
         component: str | None = None,
+        kind: str | None = None,
+        gmm_key: str | None = None,
         record_int_ids: list[int] | None = None,
     ) -> pd.DataFrame:
         """Return record identity rows.
@@ -435,14 +481,18 @@ class IMDB:
             Only records for these sites.
         component : str, optional
             Only records with this component.
+        kind : str, optional
+            Only records of this kind (`"simulated"`, `"gmm"` or `"observed"`).
+        gmm_key : str, optional
+            Only records from this GMM.
         record_int_ids : list of int, optional
             Only these `record_int_id` values.
 
         Returns
         -------
         pd.DataFrame
-            Indexed by `record_int_id`, with `event_id`, `rel_id`, `site_id` and
-            `component` columns.
+            Indexed by `record_int_id`, with `event_id`, `rel_id`, `site_id`,
+            `component`, `kind` and `gmm_key` columns.
         """
         events = self.con.table("events").select("event_int_id", "event_id")
         realisations = self.con.table("realisations").select("rel_int_id", "rel_id")
@@ -461,17 +511,32 @@ class IMDB:
             t = t.filter(t.site_id.isin(site_ids))
         if component is not None:
             t = t.filter(t.component == component)
+        if kind is not None:
+            t = t.filter(t.kind == kind)
+        if gmm_key is not None:
+            t = t.filter(t.gmm_key == gmm_key)
         if record_int_ids is not None:
             ids = ibis.memtable({"record_int_id": list(record_int_ids)})
             t = t.semi_join(ids, "record_int_id")
         return (
-            t.select("record_int_id", "event_id", "rel_id", "site_id", "component")
+            t.select(
+                "record_int_id",
+                "event_id",
+                "rel_id",
+                "site_id",
+                "component",
+                "kind",
+                "gmm_key",
+            )
             .to_pandas()
             .set_index("record_int_id")
         )
 
     def get_psa(
-        self, periods: list[float] | None = None, **filters: Any
+        self,
+        periods: list[float] | None = None,
+        sigma: bool = False,
+        **filters: Any,
     ) -> pd.DataFrame:
         """Return response spectral acceleration.
 
@@ -479,6 +544,9 @@ class IMDB:
         ----------
         periods : list of float, optional
             Periods to return, in seconds. Defaults to every period on the grid.
+        sigma : bool
+            Also return each period's ln-space total sigma, as `<period>_sigma`
+            columns.
         **filters
             Passed to `get_records` to select which records to return.
 
@@ -495,6 +563,13 @@ class IMDB:
         record_int_ids = self.get_records(**filters).index.tolist()
         t = self.con.table("psa_ims").filter(_.record_int_id.isin(record_int_ids))
         cols = {str(p): t.pSA[int(period_index.loc[p]) - 1] for p in periods}
+        if sigma:
+            cols.update(
+                {
+                    f"{p}_sigma": t.pSA_sigma[int(period_index.loc[p]) - 1]
+                    for p in periods
+                }
+            )
         return (
             t.select(record_int_id=t.record_int_id, **cols)
             .to_pandas()
@@ -502,7 +577,10 @@ class IMDB:
         )
 
     def get_fas(
-        self, frequencies: list[float] | None = None, **filters: Any
+        self,
+        frequencies: list[float] | None = None,
+        sigma: bool = False,
+        **filters: Any,
     ) -> pd.DataFrame:
         """Return Fourier amplitude spectra.
 
@@ -510,6 +588,9 @@ class IMDB:
         ----------
         frequencies : list of float, optional
             Frequencies to return, in Hz. Defaults to every frequency on the grid.
+        sigma : bool
+            Also return each frequency's ln-space total sigma, as `<frequency>_sigma`
+            columns.
         **filters
             Passed to `get_records` to select which records to return.
 
@@ -528,19 +609,30 @@ class IMDB:
         record_int_ids = self.get_records(**filters).index.tolist()
         t = self.con.table("fas_ims").filter(_.record_int_id.isin(record_int_ids))
         cols = {str(f): t.FAS[int(freq_index.loc[f]) - 1] for f in frequencies}
+        if sigma:
+            cols.update(
+                {
+                    f"{f}_sigma": t.FAS_sigma[int(freq_index.loc[f]) - 1]
+                    for f in frequencies
+                }
+            )
         return (
             t.select(record_int_id=t.record_int_id, **cols)
             .to_pandas()
             .set_index("record_int_id")
         )
 
-    def get_scalars(self, ims: list[str] | None = None, **filters: Any) -> pd.DataFrame:
+    def get_scalars(
+        self, ims: list[str] | None = None, sigma: bool = False, **filters: Any
+    ) -> pd.DataFrame:
         """Return scalar intensity measures.
 
         Parameters
         ----------
         ims : list of str, optional
             Which scalar IMs to return. Defaults to all of `schema.SCALAR_IMS`.
+        sigma : bool
+            Also return each IM's ln-space total sigma, as `<IM>_sigma` columns.
         **filters
             Passed to `get_records` to select which records to return.
 
@@ -550,6 +642,7 @@ class IMDB:
             Indexed by `record_int_id`, one column per requested IM.
         """
         ims = ims or list(schema.SCALAR_IMS)
+        cols = [*ims, *([f"{im}_sigma" for im in ims] if sigma else [])]
         record_int_ids = self.get_records(**filters).index.tolist()
         t = self.con.table("scalars_ims").filter(_.record_int_id.isin(record_int_ids))
-        return t.select("record_int_id", *ims).to_pandas().set_index("record_int_id")
+        return t.select("record_int_id", *cols).to_pandas().set_index("record_int_id")
