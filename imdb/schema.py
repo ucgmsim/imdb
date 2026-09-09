@@ -74,21 +74,21 @@ CREATE TABLE site_event (
     metadata     VARCHAR
 );
 
-CREATE SEQUENCE record_id_seq START 1;
+CREATE SEQUENCE record_int_id_seq START 1;
 
 CREATE TABLE records (
-    record_id    BIGINT DEFAULT nextval('record_id_seq'),
-    event_int_id INTEGER NOT NULL,
-    rel_int_id   INTEGER NOT NULL,
-    site_int_id  INTEGER NOT NULL,
-    component    VARCHAR NOT NULL
+    record_int_id BIGINT DEFAULT nextval('record_int_id_seq'),
+    event_int_id  INTEGER NOT NULL,
+    rel_int_id    INTEGER NOT NULL,
+    site_int_id   INTEGER NOT NULL,
+    component     VARCHAR NOT NULL
 );
 
-CREATE TABLE psa_ims (record_id BIGINT NOT NULL, pSA FLOAT[]);
-CREATE TABLE fas_ims (record_id BIGINT NOT NULL, FAS FLOAT[]);
+CREATE TABLE psa_ims (record_int_id BIGINT NOT NULL, pSA FLOAT[]);
+CREATE TABLE fas_ims (record_int_id BIGINT NOT NULL, FAS FLOAT[]);
 
 CREATE TABLE scalars_ims (
-    record_id BIGINT NOT NULL,
+    record_int_id BIGINT NOT NULL,
     PGA       FLOAT,
     PGV       FLOAT,
     PGD       FLOAT,
@@ -139,7 +139,7 @@ NOTES = {
     ),
     "identity and rebuild stability": (
         "event_id, rel_id and site_id are stable. The integer surrogates event_int_id, "
-        "rel_int_id, site_int_id and record_id are assigned at ingest and change on rebuild; "
+        "rel_int_id, site_int_id and record_int_id are assigned at ingest and change on rebuild; "
         "nothing outside the database may reference them. External references use "
         "(rel_id, site_id, component)."
     ),
@@ -172,12 +172,12 @@ NOTES = {
         "Every event has at least one realisation. A dataset with no realisation concept "
         "gets exactly one per event, with rel_id equal to event_id."
     ),
-    "record_id is file-local": (
-        "record_id is a surrogate scoped to this database file only; it is not stable "
+    "record_int_id is file-local": (
+        "record_int_id is a surrogate scoped to this database file only; it is not stable "
         "across rebuilds or between databases."
     ),
     "physical sort order": (
-        "Rows are written in event order, so event_int_id and record_id are monotonic and "
+        "Rows are written in event order, so event_int_id and record_int_id are monotonic and "
         "event filters prune row groups. Site filters do not prune. db_meta.sort_order "
         "records the ordering used."
     ),

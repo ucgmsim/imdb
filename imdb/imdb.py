@@ -236,29 +236,37 @@ class IMDB:
         Returns
         -------
         np.ndarray
-            The `record_id` assigned to each row of `df`, in input order.
+            The `record_int_id` assigned to each row of `df`, in input order.
         """
         df = df.copy()
         unknown = set(df["component"]) - set(self.db_meta["components"].split(","))
         if unknown:
             raise ValueError(f"components not in this database: {sorted(unknown)}")
 
-        assert pSA is None or pSA.shape[0] == len(df), "pSA must have one row per record"
-        assert FAS is None or FAS.shape[0] == len(df), "FAS must have one row per record"
+        assert pSA is None or pSA.shape[0] == len(df), (
+            "pSA must have one row per record"
+        )
+        assert FAS is None or FAS.shape[0] == len(df), (
+            "FAS must have one row per record"
+        )
 
         rel_int_id_mapping = self._id_map("realisations", "rel_id", "rel_int_id")
-        rel_event_int_id_mapping = self._id_map("realisations", "rel_int_id", "event_int_id")
+        rel_event_int_id_mapping = self._id_map(
+            "realisations", "rel_int_id", "event_int_id"
+        )
         site_int_id_mapping = self._id_map("sites", "site_id", "site_int_id")
 
         df["rel_int_id"] = rel_int_id_mapping.loc[df["rel_id"]].to_numpy()
         df["site_int_id"] = site_int_id_mapping.loc[df["site_id"]].to_numpy()
         df["event_int_id"] = rel_event_int_id_mapping.loc[df["rel_int_id"]].to_numpy()
-        record_id = (
-            self.con.raw_sql(f"SELECT nextval('record_id_seq') FROM range({len(df)})")
-            .df()["nextval('record_id_seq')"]
+        record_int_id = (
+            self.con.raw_sql(
+                f"SELECT nextval('record_int_id_seq') FROM range({len(df)})"
+            )
+            .df()["nextval('record_int_id_seq')"]
             .to_numpy()
         )
-        df["record_id"] = record_id
+        df["record_int_id"] = record_int_id
 
         self.con.raw_sql("BEGIN TRANSACTION")
         try:
@@ -266,7 +274,7 @@ class IMDB:
                 "records",
                 df[
                     [
-                        "record_id",
+                        "record_int_id",
                         "event_int_id",
                         "rel_int_id",
                         "site_int_id",
@@ -279,7 +287,7 @@ class IMDB:
                 self.con.insert(
                     "psa_ims",
                     pd.DataFrame(
-                        {"record_id": record_id[mask], "pSA": list(pSA[mask])}
+                        {"record_int_id": record_int_id[mask], "pSA": list(pSA[mask])}
                     ),
                 )
             if FAS is not None:
@@ -287,12 +295,12 @@ class IMDB:
                 self.con.insert(
                     "fas_ims",
                     pd.DataFrame(
-                        {"record_id": record_id[mask], "FAS": list(FAS[mask])}
+                        {"record_int_id": record_int_id[mask], "FAS": list(FAS[mask])}
                     ),
                 )
             scalar_cols = [c for c in schema.SCALAR_IMS if c in df]
             if scalar_cols:
-                scalars = df[["record_id", *scalar_cols]].copy()
+                scalars = df[["record_int_id", *scalar_cols]].copy()
                 rotd = df["component"].str.startswith("rotd")
                 for col in schema.ROTD_UNDEFINED & set(scalar_cols):
                     scalars.loc[rotd, col] = None
@@ -302,7 +310,7 @@ class IMDB:
             raise
         self.con.raw_sql("COMMIT")
         logger.info("inserted %d records", len(df))
-        return record_id
+        return record_int_id
 
     def delete_event(self, event_id: str) -> None:
         """Delete an event and everything derived from it, for a clean re-ingest.
@@ -313,11 +321,11 @@ class IMDB:
             The event to delete.
         """
         event_int_id_subquery = "(SELECT event_int_id FROM events WHERE event_id = ?)"
-        record_subquery = f"(SELECT record_id FROM records WHERE event_int_id = {event_int_id_subquery})"
+        record_subquery = f"(SELECT record_int_id FROM records WHERE event_int_id = {event_int_id_subquery})"
         statements = [
-            f"DELETE FROM psa_ims WHERE record_id IN {record_subquery}",
-            f"DELETE FROM fas_ims WHERE record_id IN {record_subquery}",
-            f"DELETE FROM scalars_ims WHERE record_id IN {record_subquery}",
+            f"DELETE FROM psa_ims WHERE record_int_id IN {record_subquery}",
+            f"DELETE FROM fas_ims WHERE record_int_id IN {record_subquery}",
+            f"DELETE FROM scalars_ims WHERE record_int_id IN {record_subquery}",
             f"DELETE FROM records WHERE event_int_id = {event_int_id_subquery}",
             f"DELETE FROM site_event WHERE event_int_id = {event_int_id_subquery}",
             f"DELETE FROM realisations WHERE event_int_id = {event_int_id_subquery}",
@@ -337,10 +345,10 @@ class IMDB:
         for table in ("records", "psa_ims", "fas_ims", "scalars_ims"):
             t = self.con.table(table)
             n_rows = t.count().to_pandas()
-            n_unique = t.record_id.nunique().to_pandas()
+            n_unique = t.record_int_id.nunique().to_pandas()
             if n_rows != n_unique:
                 problems.append(
-                    f"{table}: record_id is not unique ({n_rows} rows, {n_unique} unique)"
+                    f"{table}: record_int_id is not unique ({n_rows} rows, {n_unique} unique)"
                 )
 
         records = self.con.table("records")
@@ -413,7 +421,7 @@ class IMDB:
         rel_ids: list[str] | None = None,
         site_ids: list[str] | None = None,
         component: str | None = None,
-        record_ids: list[int] | None = None,
+        record_int_ids: list[int] | None = None,
     ) -> pd.DataFrame:
         """Return record identity rows.
 
@@ -427,13 +435,13 @@ class IMDB:
             Only records for these sites.
         component : str, optional
             Only records with this component.
-        record_ids : list of int, optional
-            Only these `record_id` values.
+        record_int_ids : list of int, optional
+            Only these `record_int_id` values.
 
         Returns
         -------
         pd.DataFrame
-            Indexed by `record_id`, with `event_id`, `rel_id`, `site_id` and
+            Indexed by `record_int_id`, with `event_id`, `rel_id`, `site_id` and
             `component` columns.
         """
         events = self.con.table("events").select("event_int_id", "event_id")
@@ -453,13 +461,13 @@ class IMDB:
             t = t.filter(t.site_id.isin(site_ids))
         if component is not None:
             t = t.filter(t.component == component)
-        if record_ids is not None:
-            ids = ibis.memtable({"record_id": list(record_ids)})
-            t = t.semi_join(ids, "record_id")
+        if record_int_ids is not None:
+            ids = ibis.memtable({"record_int_id": list(record_int_ids)})
+            t = t.semi_join(ids, "record_int_id")
         return (
-            t.select("record_id", "event_id", "rel_id", "site_id", "component")
+            t.select("record_int_id", "event_id", "rel_id", "site_id", "component")
             .to_pandas()
-            .set_index("record_id")
+            .set_index("record_int_id")
         )
 
     def get_psa(
@@ -477,16 +485,18 @@ class IMDB:
         Returns
         -------
         pd.DataFrame
-            Indexed by `record_id`, one column per requested period.
+            Indexed by `record_int_id`, one column per requested period.
         """
         grid = self.con.table("periods").to_pandas().set_index("period")["period_index"]
         if periods is None:
             periods = grid.index.tolist()
-        record_ids = self.get_records(**filters).index.tolist()
-        t = self.con.table("psa_ims").filter(_.record_id.isin(record_ids))
+        record_int_ids = self.get_records(**filters).index.tolist()
+        t = self.con.table("psa_ims").filter(_.record_int_id.isin(record_int_ids))
         cols = {str(p): t.pSA[int(grid.loc[p]) - 1] for p in periods}
         return (
-            t.select(record_id=t.record_id, **cols).to_pandas().set_index("record_id")
+            t.select(record_int_id=t.record_int_id, **cols)
+            .to_pandas()
+            .set_index("record_int_id")
         )
 
     def get_fas(
@@ -504,7 +514,7 @@ class IMDB:
         Returns
         -------
         pd.DataFrame
-            Indexed by `record_id`, one column per requested frequency.
+            Indexed by `record_int_id`, one column per requested frequency.
         """
         grid = (
             self.con.table("frequencies")
@@ -513,11 +523,13 @@ class IMDB:
         )
         if frequencies is None:
             frequencies = grid.index.tolist()
-        record_ids = self.get_records(**filters).index.tolist()
-        t = self.con.table("fas_ims").filter(_.record_id.isin(record_ids))
+        record_int_ids = self.get_records(**filters).index.tolist()
+        t = self.con.table("fas_ims").filter(_.record_int_id.isin(record_int_ids))
         cols = {str(f): t.FAS[int(grid.loc[f]) - 1] for f in frequencies}
         return (
-            t.select(record_id=t.record_id, **cols).to_pandas().set_index("record_id")
+            t.select(record_int_id=t.record_int_id, **cols)
+            .to_pandas()
+            .set_index("record_int_id")
         )
 
     def get_scalars(self, ims: list[str] | None = None, **filters: Any) -> pd.DataFrame:
@@ -533,9 +545,9 @@ class IMDB:
         Returns
         -------
         pd.DataFrame
-            Indexed by `record_id`, one column per requested IM.
+            Indexed by `record_int_id`, one column per requested IM.
         """
         ims = ims or list(schema.SCALAR_IMS)
-        record_ids = self.get_records(**filters).index.tolist()
-        t = self.con.table("scalars_ims").filter(_.record_id.isin(record_ids))
-        return t.select("record_id", *ims).to_pandas().set_index("record_id")
+        record_int_ids = self.get_records(**filters).index.tolist()
+        t = self.con.table("scalars_ims").filter(_.record_int_id.isin(record_int_ids))
+        return t.select("record_int_id", *ims).to_pandas().set_index("record_int_id")
