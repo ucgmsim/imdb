@@ -117,6 +117,14 @@ def missing_reason(data: Path, fault_name: str, nhm_faults: set[str]) -> str | N
     return None
 
 
+def discover_periods(data: Path, fault_name: str) -> list[float]:
+    """pSA periods, read from the first realisation's IM file (same across all faults)."""
+    im_dir = data / "im_data" / fault_name / "IM"
+    first_rel = sorted(im_dir.glob(f"{fault_name}_REL*.csv"), key=rel_number)[0]
+    columns = pd.read_csv(first_rel, nrows=0).columns
+    return [float(c.removeprefix("pSA_")) for c in columns if c.startswith("pSA_")]
+
+
 def main(data: Path, db_path: Path) -> None:
     sites_all = load_sites(data)
     nhm_faults = nhm.load_nhm(str(data / "NZ_FLTmodel_2010.txt"))
@@ -129,34 +137,39 @@ def main(data: Path, db_path: Path) -> None:
         else:
             faults.append(fault_name)
 
-    im_periods = None
-    events, realisations, site_events, records, psa_rows = [], [], [], [], []
-    gmm_records, gmm_psa_rows, gmm_psa_sigma_rows = [], [], []
-    sites_used: dict[str, pd.Series] = {}
+    im_periods = discover_periods(data, faults[0])
+    db = IMDB.create(
+        db_path, periods=im_periods, components=["geom", "rotd50"], db_meta={"dataset_id": "nz_nshm_2010_fault_ims"}
+    )
+    sites_seen: set[str] = set()
 
     for fault_name in tqdm(faults, desc="events"):
         srf_dir = data / "source_data" / fault_name / "Srf"
         im_dir = data / "im_data" / fault_name / "IM"
         base = pd.read_csv(srf_dir / f"{fault_name}.csv").iloc[0]
 
-        events.append(
-            {
-                "event_id": fault_name,
-                "magnitude": base["magnitude"],
-                "tect_type": base["tect_type"],
-                "dip": base["dip"],
-                "dip_dir": base["dip_dir"],
-                "dtop": base["dtop"],
-                "dbottom": base["dbottom"],
-                "length": base["length"],
-                "metadata": json.dumps(
+        db.add_events(
+            pd.DataFrame(
+                [
                     {
-                        "fault_type": base["fault_type"],
-                        "plane_count": int(base["plane_count"]),
-                        "slip_rate": base["slip_rate"],
+                        "event_id": fault_name,
+                        "magnitude": base["magnitude"],
+                        "tect_type": base["tect_type"],
+                        "dip": base["dip"],
+                        "dip_dir": base["dip_dir"],
+                        "dtop": base["dtop"],
+                        "dbottom": base["dbottom"],
+                        "length": base["length"],
+                        "metadata": json.dumps(
+                            {
+                                "fault_type": base["fault_type"],
+                                "plane_count": int(base["plane_count"]),
+                                "slip_rate": base["slip_rate"],
+                            }
+                        ),
                     }
-                ),
-            }
+                ]
+            )
         )
 
         trace = nhm_faults[fault_name].trace[:, ::-1]  # (lon,lat) -> (lat,lon)
@@ -165,7 +178,7 @@ def main(data: Path, db_path: Path) -> None:
         )
 
         event_sites: set[str] = set()
-        rel_contexts = []
+        realisations, rel_contexts, records, psa_rows = [], [], [], []
         rel_paths = sorted(srf_dir.glob(f"{fault_name}_REL*.csv"), key=rel_number)
         for rel_path in rel_paths:
             rel = pd.read_csv(rel_path).iloc[0]
@@ -195,13 +208,9 @@ def main(data: Path, db_path: Path) -> None:
             )
 
             im = pd.read_csv(im_dir / f"{rel_id}.csv")
-            if im_periods is None:
-                im_periods = [float(c.removeprefix("pSA_")) for c in im.columns if c.startswith("pSA_")]
             psa_cols = [f"pSA_{p}" for p in im_periods]
 
             event_sites.update(im["station"])
-            for station in im["station"]:
-                sites_used.setdefault(station, sites_all.loc[station])
 
             records.append(
                 pd.DataFrame(
@@ -228,6 +237,12 @@ def main(data: Path, db_path: Path) -> None:
                 )
             )
 
+        new_sites = sorted(event_sites - sites_seen)
+        if new_sites:
+            db.add_sites(sites_all.loc[new_sites].reset_index(names="site_id"))
+            sites_seen.update(new_sites)
+        db.add_realisations(pd.DataFrame(realisations))
+
         # site_event distances, computed once per event, over every site this event references.
         sorted_sites = sorted(event_sites)
         coords = sites_all.loc[sorted_sites]
@@ -236,25 +251,24 @@ def main(data: Path, db_path: Path) -> None:
         rrup = fault.rrup_distance(latlondepth)
         rjb = fault.rjb_distance(latlondepth)
         rx, ry = fault.rx_ry_distance(latlon)
-        site_events.append(
-            pd.DataFrame(
-                {
-                    "site_id": sorted_sites,
-                    "event_id": fault_name,
-                    "rrup": np.asarray(rrup) / 1000,
-                    "rjb": np.asarray(rjb) / 1000,
-                    "rx": np.asarray(rx) / 1000,
-                    "ry": np.asarray(ry) / 1000,
-                }
-            )
+        site_event_df = pd.DataFrame(
+            {
+                "site_id": sorted_sites,
+                "event_id": fault_name,
+                "rrup": np.asarray(rrup) / 1000,
+                "rjb": np.asarray(rjb) / 1000,
+                "rx": np.asarray(rx) / 1000,
+                "ry": np.asarray(ry) / 1000,
+            }
         )
+        db.add_site_event(site_event_df)
+        db.add_records(pd.concat(records, ignore_index=True), pSA=np.concatenate(psa_rows, axis=0))
 
         # empirical GMM predictions, over the same (rel_id, site_id) pairs as the simulated records.
         context = pd.concat(rel_contexts, ignore_index=True)
         site_attrs = sites_all.loc[context["site_id"], ["vs30", "z1p0", "z2p5"]].reset_index(drop=True)
         distances = (
-            site_events[-1]
-            .set_index("site_id")
+            site_event_df.set_index("site_id")
             .loc[context["site_id"], ["rrup", "rjb", "rx", "ry"]]
             .reset_index(drop=True)
         )
@@ -268,26 +282,7 @@ def main(data: Path, db_path: Path) -> None:
         rupture_df["backarc"] = False
 
         gmm_df, gmm_psa, gmm_psa_sigma = run_pSA_logic_tree(rupture_df, base["tect_type"], im_periods)
-        gmm_records.append(gmm_df)
-        gmm_psa_rows.append(gmm_psa)
-        gmm_psa_sigma_rows.append(gmm_psa_sigma)
-
-    sites_df = pd.DataFrame(sites_used.values(), index=sites_used.keys()).reset_index(names="site_id")
-    records_df = pd.concat(records, ignore_index=True)
-    psa = np.concatenate(psa_rows, axis=0)
-    gmm_records_df = pd.concat(gmm_records, ignore_index=True)
-    gmm_psa = np.concatenate(gmm_psa_rows, axis=0)
-    gmm_psa_sigma = np.concatenate(gmm_psa_sigma_rows, axis=0)
-
-    db = IMDB.create(
-        db_path, periods=im_periods, components=["geom", "rotd50"], db_meta={"dataset_id": "nz_nshm_2010_fault_ims"}
-    )
-    db.add_events(pd.DataFrame(events))
-    db.add_sites(sites_df)
-    db.add_site_event(pd.concat(site_events, ignore_index=True))
-    db.add_realisations(pd.DataFrame(realisations))
-    db.add_records(records_df, pSA=psa)
-    db.add_records(gmm_records_df, pSA=gmm_psa, pSA_sigma=gmm_psa_sigma)
+        db.add_records(gmm_df, pSA=gmm_psa, pSA_sigma=gmm_psa_sigma)
 
     problems = db.validate()
     print("validate():", problems or "clean")
