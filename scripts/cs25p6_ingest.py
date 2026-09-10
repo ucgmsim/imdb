@@ -17,13 +17,15 @@
 
 """Ingest NZ NSHM 2010 fault ruptures (source_data/im_data) into an IMDB.
 
-Only the faults that have simulated IM output (RuatoriaS1, Thornton01, UrutiR2) are
-ingested; base (non-REL) Srf/IM files are skipped, only numbered realisations count.
+Every fault with simulated IM output (a directory under `im_data/`) is ingested;
+base (non-REL) Srf/IM files are skipped, only numbered realisations count. A fault
+missing its source_data or NZ_FLTmodel_2010.txt entry is skipped with a warning.
 """
 
 import argparse
 import json
 import re
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -35,7 +37,12 @@ from imdb import IMDB
 from qcore import nhm
 from source_modelling.sources import Fault
 
-FAULTS = ["RuatoriaS1", "Thornton01", "UrutiR2"]
+# oq_wrapper warns per-row when falling back to active-shallow GMMs for VOLCANIC tect
+# type; that's expected for this dataset (NSHM2022 has no dedicated volcanic models).
+warnings.filterwarnings(
+    "ignore", message="Using active_shallow type model for VOLCANIC tectonic type", category=UserWarning
+)
+
 SCALAR_COLS = ["PGA", "PGV", "CAV", "AI", "Ds575", "Ds595"]
 
 
@@ -93,14 +100,41 @@ def rel_number(path: Path) -> int:
     return int(match.group(1))
 
 
+def discover_faults(data: Path) -> list[str]:
+    """Faults with simulated IM output: every directory under `im_data/`."""
+    return sorted(p.name for p in (data / "im_data").iterdir() if p.is_dir())
+
+
+def missing_reason(data: Path, fault_name: str, nhm_faults: set[str]) -> str | None:
+    """Why `fault_name` can't be ingested, or `None` if it has everything required."""
+    if fault_name not in nhm_faults:
+        return "not present in NZ_FLTmodel_2010.txt"
+    srf_dir = data / "source_data" / fault_name / "Srf"
+    if not (srf_dir / f"{fault_name}.csv").exists():
+        return f"missing {srf_dir / f'{fault_name}.csv'}"
+    if not any(srf_dir.glob(f"{fault_name}_REL*.csv")):
+        return f"no {fault_name}_REL*.csv realisation files in {srf_dir}"
+    return None
+
+
 def main(data: Path, db_path: Path) -> None:
     sites_all = load_sites(data)
+    nhm_faults = nhm.load_nhm(str(data / "NZ_FLTmodel_2010.txt"))
+
+    faults = []
+    for fault_name in discover_faults(data):
+        reason = missing_reason(data, fault_name, set(nhm_faults))
+        if reason is not None:
+            print(f"WARNING: skipping {fault_name}: {reason}")
+        else:
+            faults.append(fault_name)
+
     im_periods = None
     events, realisations, site_events, records, psa_rows = [], [], [], [], []
     gmm_records, gmm_psa_rows, gmm_psa_sigma_rows = [], [], []
     sites_used: dict[str, pd.Series] = {}
 
-    for fault_name in tqdm(FAULTS, desc="events"):
+    for fault_name in tqdm(faults, desc="events"):
         srf_dir = data / "source_data" / fault_name / "Srf"
         im_dir = data / "im_data" / fault_name / "IM"
         base = pd.read_csv(srf_dir / f"{fault_name}.csv").iloc[0]
@@ -125,7 +159,7 @@ def main(data: Path, db_path: Path) -> None:
             }
         )
 
-        trace = nhm.load_nhm(str(data / "NZ_FLTmodel_2010.txt"))[fault_name].trace[:, ::-1]  # (lon,lat) -> (lat,lon)
+        trace = nhm_faults[fault_name].trace[:, ::-1]  # (lon,lat) -> (lat,lon)
         fault = Fault.from_trace_points(
             trace, dtop=base["dtop"], dbottom=base["dbottom"], dip=base["dip"], dip_dir=base["dip_dir"]
         )
@@ -269,7 +303,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("data", type=Path, help="Directory containing source_data/, im_data/ and the site files")
     parser.add_argument(
-        "db-path", type=Path, help="Output IMDB path"
+        "db_path", type=Path, help="Output IMDB path"
     )
     args = parser.parse_args()
     main(args.data, args.db_path)
