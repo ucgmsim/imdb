@@ -88,6 +88,34 @@ def test_schema_version_mismatch_rejected(db):
         IMDB(path, read_only=True).open()
 
 
+def test_add_records_rejects_duplicate_within_df(db):
+    with pytest.raises(ValueError, match="duplicate"):
+        db.add_records(
+            pd.DataFrame(
+                {
+                    "rel_id": ["eventA_rel0", "eventA_rel0"],
+                    "site_id": ["siteA", "siteA"],
+                    "component": ["000", "000"],
+                    "kind": ["observed", "observed"],
+                }
+            )
+        )
+
+
+def test_add_records_rejects_duplicate_of_existing_record(db):
+    with pytest.raises(ValueError, match="already exist"):
+        db.add_records(
+            pd.DataFrame(
+                {
+                    "rel_id": ["eventA_rel0"],
+                    "site_id": ["siteA"],
+                    "component": ["000"],
+                    "kind": ["simulated"],
+                }
+            )
+        )
+
+
 def test_validate_catches_sigma_on_non_gmm_record(db):
     db.add_records(
         pd.DataFrame(
@@ -95,7 +123,7 @@ def test_validate_catches_sigma_on_non_gmm_record(db):
                 "rel_id": ["eventA_rel0"],
                 "site_id": ["siteA"],
                 "component": ["000"],
-                "kind": ["simulated"],
+                "kind": ["observed"],
                 "PGA": [0.5],
                 "PGA_sigma": [0.6],
             }
@@ -113,7 +141,7 @@ def test_all_nan_row_not_written_to_psa(db):
                 "rel_id": ["eventA_rel0", "eventA_rel0"],
                 "site_id": ["siteA", "siteB"],
                 "component": ["000", "000"],
-                "kind": ["simulated", "simulated"],
+                "kind": ["observed", "observed"],
             }
         ),
         pSA=np.array([[1.0] * len(PERIODS), [np.nan] * len(PERIODS)]),

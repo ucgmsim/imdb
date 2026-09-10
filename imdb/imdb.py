@@ -256,6 +256,12 @@ class IMDB:
         -------
         np.ndarray
             The `record_int_id` assigned to each row of `df`, in input order.
+
+        Raises
+        ------
+        ValueError
+            If `df` contains duplicate `(rel_id, site_id, component, kind, gmm_key)`
+            rows, or any of them already exist in this database.
         """
         df = df.copy()
 
@@ -292,6 +298,22 @@ class IMDB:
         df["rel_int_id"] = rel_int_id_mapping.loc[df["rel_id"]].to_numpy()
         df["site_int_id"] = site_int_id_mapping.loc[df["site_id"]].to_numpy()
         df["event_int_id"] = rel_event_int_id_mapping.loc[df["rel_int_id"]].to_numpy()
+
+        key_cols = ["rel_int_id", "site_int_id", "component", "kind", "gmm_key"]
+        keys = df[key_cols]
+        if keys.duplicated().any():
+            raise ValueError(
+                "df contains duplicate records (same rel_id, site_id, component, "
+                "kind and gmm_key)"
+            )
+        existing = self.con.table("records").select(*key_cols).to_pandas()
+        collisions = keys.merge(existing, on=key_cols, how="inner")
+        if not collisions.empty:
+            raise ValueError(
+                f"{len(collisions)} record(s) already exist in this database "
+                "(same rel_id, site_id, component, kind and gmm_key)"
+            )
+
         record_int_id = (
             self.con.raw_sql(
                 f"SELECT nextval('record_int_id_seq') FROM range({len(df)})"
