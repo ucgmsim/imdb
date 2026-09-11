@@ -306,7 +306,12 @@ class IMDB:
                 "df contains duplicate records (same rel_id, site_id, component, "
                 "kind and gmm_key)"
             )
-        existing = self.con.table("records").select(*key_cols).to_pandas()
+        existing = (
+            self.con.table("records")
+            .filter(_.rel_int_id.isin(df["rel_int_id"].unique()))
+            .select(*key_cols)
+            .to_pandas()
+        )
         collisions = keys.merge(existing, on=key_cols, how="inner")
         if not collisions.empty:
             raise ValueError(

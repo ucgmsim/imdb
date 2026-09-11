@@ -24,10 +24,10 @@ missing its source_data or NZ_FLTmodel_2010.txt entry is skipped with a warning.
 
 import argparse
 import json
+import multiprocessing
 import os
 import re
 import warnings
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,6 +47,7 @@ warnings.filterwarnings(
 )
 
 SCALAR_COLS = ["PGA", "PGV", "CAV", "AI", "Ds575", "Ds595"]
+GMM_BATCH_RELS = 8  # realisations per oq_wrapper call: bounds peak memory, amortises per-call overhead
 
 
 def run_pSA_logic_tree(rupture_df: pd.DataFrame, tect_type: str, periods: list[float]):
@@ -79,8 +80,8 @@ def run_pSA_logic_tree(rupture_df: pd.DataFrame, tect_type: str, periods: list[f
                 }
             )
         )
-        psa_rows.append(np.exp(result[mean_cols].to_numpy()))
-        psa_sigma_rows.append(result[sigma_cols].to_numpy())
+        psa_rows.append(np.exp(result[mean_cols].to_numpy(dtype=np.float32)))
+        psa_sigma_rows.append(result[sigma_cols].to_numpy(dtype=np.float32))
 
     return pd.concat(gmm_rows, ignore_index=True), np.concatenate(psa_rows), np.concatenate(psa_sigma_rows)
 
@@ -225,7 +226,7 @@ def process_fault(fault_name: str) -> FaultResult:
                 }
             )
         )
-        psa_rows.append(im[psa_cols].to_numpy())
+        psa_rows.append(im[psa_cols].to_numpy(dtype=np.float32))
 
         rel_contexts.append(
             pd.DataFrame(
@@ -261,21 +262,36 @@ def process_fault(fault_name: str) -> FaultResult:
     psa = np.concatenate(psa_rows, axis=0)
 
     # empirical GMM predictions, over the same (rel_id, site_id) pairs as the simulated records.
-    context = pd.concat(rel_contexts, ignore_index=True)
-    site_attrs = sites_all.loc[context["site_id"], ["vs30", "z1p0", "z2p5"]].reset_index(drop=True)
-    distances = (
-        site_event_df.set_index("site_id").loc[context["site_id"], ["rrup", "rjb", "rx", "ry"]].reset_index(drop=True)
-    )
-    rupture_df = pd.concat([context.reset_index(drop=True), site_attrs, distances], axis=1).rename(
-        columns={"z1p0": "z1pt0", "z2p5": "z2pt5"}
-    )
-    rupture_df["dip"] = base["dip"]
-    rupture_df["ztor"] = base["dtop"]
-    rupture_df["zbot"] = base["dbottom"]
-    rupture_df["vs30measured"] = True
-    rupture_df["backarc"] = False
+    # Run a batch of realisations at a time rather than building one rupture_df for the whole
+    # fault: oq_wrapper's GMM logic tree evaluates rows independently, so this is numerically
+    # identical, but bounds the peak memory of a single run_gmm_logic_tree call to GMM_BATCH_RELS
+    # realisations' worth of sites instead of (all realisations x sites), which for a large fault
+    # is the dominant memory driver. oq_wrapper has real fixed per-call overhead (~1s, likely GSIM
+    # /logic-tree setup), so batching a few realisations per call rather than one at a time keeps
+    # the added run time small while still bounding memory.
+    site_distances = site_event_df.set_index("site_id")[["rrup", "rjb", "rx", "ry"]]
+    gmm_dfs, gmm_psa_rows, gmm_psa_sigma_rows = [], [], []
+    for batch_start in range(0, len(rel_contexts), GMM_BATCH_RELS):
+        context = pd.concat(rel_contexts[batch_start : batch_start + GMM_BATCH_RELS], ignore_index=True)
+        site_attrs = sites_all.loc[context["site_id"], ["vs30", "z1p0", "z2p5"]].reset_index(drop=True)
+        distances = site_distances.loc[context["site_id"]].reset_index(drop=True)
+        rupture_df = pd.concat([context.reset_index(drop=True), site_attrs, distances], axis=1).rename(
+            columns={"z1p0": "z1pt0", "z2p5": "z2pt5"}
+        )
+        rupture_df["dip"] = base["dip"]
+        rupture_df["ztor"] = base["dtop"]
+        rupture_df["zbot"] = base["dbottom"]
+        rupture_df["vs30measured"] = True
+        rupture_df["backarc"] = False
 
-    gmm_df, gmm_psa, gmm_psa_sigma = run_pSA_logic_tree(rupture_df, base["tect_type"], im_periods)
+        rel_gmm_df, rel_gmm_psa, rel_gmm_psa_sigma = run_pSA_logic_tree(rupture_df, base["tect_type"], im_periods)
+        gmm_dfs.append(rel_gmm_df)
+        gmm_psa_rows.append(rel_gmm_psa)
+        gmm_psa_sigma_rows.append(rel_gmm_psa_sigma)
+
+    gmm_df = pd.concat(gmm_dfs, ignore_index=True)
+    gmm_psa = np.concatenate(gmm_psa_rows, axis=0)
+    gmm_psa_sigma = np.concatenate(gmm_psa_sigma_rows, axis=0)
 
     return FaultResult(
         event=event,
@@ -291,6 +307,9 @@ def process_fault(fault_name: str) -> FaultResult:
 
 
 def main(data: Path, db_path: Path, workers: int) -> None:
+    if db_path.exists():
+        raise FileExistsError(f"{db_path} already exists")
+
     sites_all = load_sites(data)
     nhm_faults = nhm.load_nhm(str(data / "NZ_FLTmodel_2010.txt"))
 
@@ -308,10 +327,13 @@ def main(data: Path, db_path: Path, workers: int) -> None:
     )
     sites_seen: set[str] = set()
 
-    with ProcessPoolExecutor(
-        max_workers=workers, initializer=_init_worker, initargs=(data, sites_all, nhm_faults, im_periods)
+    with multiprocessing.Pool(
+        processes=workers,
+        initializer=_init_worker,
+        initargs=(data, sites_all, nhm_faults, im_periods),
+        maxtasksperchild=1,
     ) as pool:
-        for result in tqdm(pool.map(process_fault, faults, chunksize=1), total=len(faults), desc="events"):
+        for result in tqdm(pool.imap_unordered(process_fault, faults), total=len(faults), desc="events"):
             db.add_events(pd.DataFrame([result.event]))
             new_sites = sorted(set(result.event_sites) - sites_seen)
             if new_sites:
