@@ -24,11 +24,12 @@ missing its source_data or NZ_FLTmodel_2010.txt entry is skipped with a warning.
 
 import argparse
 import json
-import multiprocessing
 import os
 import re
 import warnings
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 
 import numpy as np
@@ -48,6 +49,7 @@ warnings.filterwarnings(
 
 SCALAR_COLS = ["PGA", "PGV", "CAV", "AI", "Ds575", "Ds595"]
 GMM_BATCH_RELS = 8  # realisations per oq_wrapper call: bounds peak memory, amortises per-call overhead
+DB_MEMORY_LIMIT = "8GB"  # DuckDB buffer pool cap, leaving RAM for the workers
 
 
 def run_pSA_logic_tree(rupture_df: pd.DataFrame, tect_type: str, periods: list[float]):
@@ -325,24 +327,44 @@ def main(data: Path, db_path: Path, workers: int) -> None:
     db = IMDB.create(
         db_path, periods=im_periods, components=["geom", "rotd50"], db_meta={"dataset_id": "nz_nshm_2010_fault_ims"}
     )
+    # DuckDB defaults memory_limit to 80% of RAM; left alone its buffer pool grows with the
+    # database and crowds out the worker processes. Capped, it spills to disk instead.
+    db.con.raw_sql(f"PRAGMA memory_limit='{DB_MEMORY_LIMIT}'")
     sites_seen: set[str] = set()
 
-    with multiprocessing.Pool(
-        processes=workers,
+    # Keep only a small window of faults in flight. Pool.imap_unordered/submit-all run every
+    # task as fast as the workers allow and buffer each finished result in the parent, with no
+    # backpressure; since the workers (parallel) outrun the database writer (serial), that
+    # backlog grows without bound, and a result here is GBs.
+    with ProcessPoolExecutor(
+        max_workers=workers,
         initializer=_init_worker,
         initargs=(data, sites_all, nhm_faults, im_periods),
-        maxtasksperchild=1,
+        max_tasks_per_child=1,
     ) as pool:
-        for result in tqdm(pool.imap_unordered(process_fault, faults), total=len(faults), desc="events"):
-            db.add_events(pd.DataFrame([result.event]))
-            new_sites = sorted(set(result.event_sites) - sites_seen)
-            if new_sites:
-                db.add_sites(sites_all.loc[new_sites].reset_index(names="site_id"))
-                sites_seen.update(new_sites)
-            db.add_realisations(pd.DataFrame(result.realisations))
-            db.add_site_event(result.site_event_df)
-            db.add_records(result.records_df, pSA=result.psa)
-            db.add_records(result.gmm_df, pSA=result.gmm_psa, pSA_sigma=result.gmm_psa_sigma)
+        queued = iter(faults)
+        pending = {pool.submit(process_fault, name) for name in islice(queued, workers + 1)}
+        progress = tqdm(total=len(faults), desc="events")
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            pending |= {pool.submit(process_fault, name) for name in islice(queued, len(done))}
+            for future in done:
+                result = future.result()
+                db.add_events(pd.DataFrame([result.event]))
+                new_sites = sorted(set(result.event_sites) - sites_seen)
+                if new_sites:
+                    db.add_sites(sites_all.loc[new_sites].reset_index(names="site_id"))
+                    sites_seen.update(new_sites)
+                db.add_realisations(pd.DataFrame(result.realisations))
+                db.add_site_event(result.site_event_df)
+                db.add_records(result.records_df, pSA=result.psa)
+                db.add_records(result.gmm_df, pSA=result.gmm_psa, pSA_sigma=result.gmm_psa_sigma)
+                del result
+                progress.update()
+            # A Future caches its result until collected, so drop the finished ones before
+            # waiting again, or the window holds more than it looks like it does.
+            done.clear()
+        progress.close()
 
     problems = db.validate()
     print("validate():", problems or "clean")
