@@ -48,44 +48,34 @@ warnings.filterwarnings(
 )
 
 SCALAR_COLS = ["PGA", "PGV", "CAV", "AI", "Ds575", "Ds595"]
-GMM_BATCH_RELS = 8  # realisations per oq_wrapper call: bounds peak memory, amortises per-call overhead
 DB_MEMORY_LIMIT = "8GB"  # DuckDB buffer pool cap, leaving RAM for the workers
 
 
 def run_pSA_logic_tree(rupture_df: pd.DataFrame, tect_type: str, periods: list[float]):
-    """Run the NSHM2022 pSA GM logic tree: the weighted combination plus every individual GMM/branch.
+    """Run the NSHM2022 pSA GM logic tree, keeping only the weighted combination.
 
     NSHM2022's logic tree config only defines weights for pSA (not PGA/PGV), so that's
     the only IM available through `run_gmm_logic_tree`.
     """
-    weighted, ind = oqw.run_gmm_logic_tree(
+    result = oqw.run_gmm_logic_tree(
         oqw.constants.GMMLogicTree.NSHM2022,
         oqw.constants.TectType[tect_type],
         rupture_df,
         "pSA",
         periods=periods,
-        return_ind_results=True,
     )
-    mean_cols = [f"pSA_{p}_mean" for p in periods]
-    sigma_cols = [f"pSA_{p}_std_Total" for p in periods]
-
-    gmm_rows, psa_rows, psa_sigma_rows = [], [], []
-    for gmm_key, result in {"NSHM2022": weighted, **{k: df for k, (_, df) in ind.items()}}.items():
-        gmm_rows.append(
-            pd.DataFrame(
-                {
-                    "rel_id": rupture_df["rel_id"],
-                    "site_id": rupture_df["site_id"],
-                    "component": "rotd50",
-                    "kind": "gmm",
-                    "gmm_key": gmm_key,
-                }
-            )
-        )
-        psa_rows.append(np.exp(result[mean_cols].to_numpy(dtype=np.float32)))
-        psa_sigma_rows.append(result[sigma_cols].to_numpy(dtype=np.float32))
-
-    return pd.concat(gmm_rows, ignore_index=True), np.concatenate(psa_rows), np.concatenate(psa_sigma_rows)
+    gmm_df = pd.DataFrame(
+        {
+            "rel_id": rupture_df["rel_id"],
+            "site_id": rupture_df["site_id"],
+            "component": "rotd50",
+            "kind": "gmm",
+            "gmm_key": "NSHM2022",
+        }
+    )
+    psa = np.exp(result[[f"pSA_{p}_mean" for p in periods]].to_numpy(dtype=np.float32))
+    psa_sigma = result[[f"pSA_{p}_std_Total" for p in periods]].to_numpy(dtype=np.float32)
+    return gmm_df, psa, psa_sigma
 
 
 def load_sites(data: Path) -> pd.DataFrame:
@@ -264,36 +254,21 @@ def process_fault(fault_name: str) -> FaultResult:
     psa = np.concatenate(psa_rows, axis=0)
 
     # empirical GMM predictions, over the same (rel_id, site_id) pairs as the simulated records.
-    # Run a batch of realisations at a time rather than building one rupture_df for the whole
-    # fault: oq_wrapper's GMM logic tree evaluates rows independently, so this is numerically
-    # identical, but bounds the peak memory of a single run_gmm_logic_tree call to GMM_BATCH_RELS
-    # realisations' worth of sites instead of (all realisations x sites), which for a large fault
-    # is the dominant memory driver. oq_wrapper has real fixed per-call overhead (~1s, likely GSIM
-    # /logic-tree setup), so batching a few realisations per call rather than one at a time keeps
-    # the added run time small while still bounding memory.
-    site_distances = site_event_df.set_index("site_id")[["rrup", "rjb", "rx", "ry"]]
-    gmm_dfs, gmm_psa_rows, gmm_psa_sigma_rows = [], [], []
-    for batch_start in range(0, len(rel_contexts), GMM_BATCH_RELS):
-        context = pd.concat(rel_contexts[batch_start : batch_start + GMM_BATCH_RELS], ignore_index=True)
-        site_attrs = sites_all.loc[context["site_id"], ["vs30", "z1p0", "z2p5"]].reset_index(drop=True)
-        distances = site_distances.loc[context["site_id"]].reset_index(drop=True)
-        rupture_df = pd.concat([context.reset_index(drop=True), site_attrs, distances], axis=1).rename(
-            columns={"z1p0": "z1pt0", "z2p5": "z2pt5"}
-        )
-        rupture_df["dip"] = base["dip"]
-        rupture_df["ztor"] = base["dtop"]
-        rupture_df["zbot"] = base["dbottom"]
-        rupture_df["vs30measured"] = True
-        rupture_df["backarc"] = False
+    context = pd.concat(rel_contexts, ignore_index=True)
+    site_attrs = sites_all.loc[context["site_id"], ["vs30", "z1p0", "z2p5"]].reset_index(drop=True)
+    distances = (
+        site_event_df.set_index("site_id").loc[context["site_id"], ["rrup", "rjb", "rx", "ry"]].reset_index(drop=True)
+    )
+    rupture_df = pd.concat([context, site_attrs, distances], axis=1).rename(
+        columns={"z1p0": "z1pt0", "z2p5": "z2pt5"}
+    )
+    rupture_df["dip"] = base["dip"]
+    rupture_df["ztor"] = base["dtop"]
+    rupture_df["zbot"] = base["dbottom"]
+    rupture_df["vs30measured"] = True
+    rupture_df["backarc"] = False
 
-        rel_gmm_df, rel_gmm_psa, rel_gmm_psa_sigma = run_pSA_logic_tree(rupture_df, base["tect_type"], im_periods)
-        gmm_dfs.append(rel_gmm_df)
-        gmm_psa_rows.append(rel_gmm_psa)
-        gmm_psa_sigma_rows.append(rel_gmm_psa_sigma)
-
-    gmm_df = pd.concat(gmm_dfs, ignore_index=True)
-    gmm_psa = np.concatenate(gmm_psa_rows, axis=0)
-    gmm_psa_sigma = np.concatenate(gmm_psa_sigma_rows, axis=0)
+    gmm_df, gmm_psa, gmm_psa_sigma = run_pSA_logic_tree(rupture_df, base["tect_type"], im_periods)
 
     return FaultResult(
         event=event,
