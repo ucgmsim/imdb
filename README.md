@@ -38,6 +38,14 @@ erDiagram
         VARCHAR     event_id UK "stable identity"
         FLOAT       magnitude
         tect_type_t tect_type "ENUM, 4 values"
+        FLOAT       dip
+        FLOAT       dip_dir
+        FLOAT       dtop
+        FLOAT       dbottom
+        FLOAT       length
+        VARCHAR     source_wkt
+        VARCHAR     trace_wkt
+        VARCHAR     domain_wkt
         VARCHAR     metadata "JSON"
     }
 
@@ -47,6 +55,9 @@ erDiagram
         INTEGER event_int_id FK
         FLOAT   magnitude
         FLOAT   rake
+        FLOAT   hypo_lat
+        FLOAT   hypo_lon
+        FLOAT   hypo_depth
         VARCHAR metadata "JSON"
     }
 
@@ -56,6 +67,8 @@ erDiagram
         FLOAT   lat
         FLOAT   lon
         FLOAT   vs30 "m/s"
+        FLOAT   z1p0 "km"
+        FLOAT   z2p5 "km"
         VARCHAR metadata "JSON"
     }
 
@@ -63,6 +76,9 @@ erDiagram
         INTEGER site_int_id "logical key"
         INTEGER event_int_id "logical key"
         FLOAT   rrup "km, event level"
+        FLOAT   rjb "km, event level"
+        FLOAT   rx "km, event level"
+        FLOAT   ry "km, event level"
         VARCHAR metadata "JSON"
     }
 
