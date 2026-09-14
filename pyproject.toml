@@ -27,10 +27,16 @@ types = [
 ]
 dev = ["ruff", "deptry", "ty", "numpydoc"]
 
+[tool.deptry]
+extend_exclude = ["scripts"]
+
 [tool.setuptools_scm]
 
 [tool.setuptools.packages.find]
 include = ["imdb*"]
+
+[tool.ruff]
+extend-exclude = ["scripts"]
 
 [tool.ruff.lint]
 extend-select = [
@@ -68,6 +74,9 @@ known-first-party = ["imdb", "qcore", "IM", "workflow", "source_modelling"]
 "__init__.py" = ["D104"]
 # Ignore docstring errors and fixture annotations in tests folder
 "tests/**.py" = ["D", "ANN001"]
+
+[tool.ty.src]
+exclude = ["scripts"]
 
 [tool.numpydoc_validation]
 checks = [

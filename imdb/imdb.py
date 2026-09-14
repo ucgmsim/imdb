@@ -29,14 +29,28 @@ class IMDB:
     """
 
     def __init__(self, path: Path, read_only: bool = True) -> None:
-        """Set up the database path; does not open a connection."""
+        """Set up the database path; does not open a connection.
+
+        Parameters
+        ----------
+        path : Path
+            Path to the database file.
+        read_only : bool
+            Open the database read-only.
+        """
         self.path = Path(path)
         self.read_only = read_only
         self._con: DuckDBBackend | None = None
 
     @property
     def con(self) -> DuckDBBackend:
-        """The underlying ibis connection. Raises if the database is not open."""
+        """The underlying ibis connection. Raises if the database is not open.
+
+        Returns
+        -------
+        DuckDBBackend
+            The open ibis connection.
+        """
         if self._con is None:
             raise RuntimeError(
                 "database is not open; call .open() or use as a context manager"
@@ -44,7 +58,13 @@ class IMDB:
         return self._con
 
     def open(self) -> Self:
-        """Open the database connection, if not already open."""
+        """Open the database connection, if not already open.
+
+        Returns
+        -------
+        Self
+            This database, open for use.
+        """
         if self._con is None:
             self._con = ibis.duckdb.connect(self.path, read_only=self.read_only)
             if "db_meta" in self._con.list_tables():
@@ -60,7 +80,13 @@ class IMDB:
 
     @property
     def db_meta(self) -> dict[str, str]:
-        """The `db_meta` table, as a dict."""
+        """The `db_meta` table, as a dict.
+
+        Returns
+        -------
+        dict of str to str
+            The `db_meta` table's `key`/`value` rows.
+        """
         df = self.con.table("db_meta").to_pandas()
         return dict(zip(df["key"], df["value"], strict=True))
 
@@ -152,13 +178,43 @@ class IMDB:
         return db
 
     def _next_ids(self, table: str, int_col: str, n: int) -> np.ndarray:
-        """Return `n` new contiguous integer ids for `table`, starting after the current max."""
+        """Return `n` new contiguous integer ids for `table`, starting after the current max.
+
+        Parameters
+        ----------
+        table : str
+            Table to find the current max id in.
+        int_col : str
+            The integer id column of `table`.
+        n : int
+            How many new ids to return.
+
+        Returns
+        -------
+        np.ndarray
+            `n` new contiguous integer ids.
+        """
         current = self.con.table(table)[int_col].max().to_pandas()
         start = 0 if pd.isna(current) else int(current) + 1  # ty: ignore[invalid-argument-type]
         return np.arange(start, start + n)
 
     def _id_map(self, table: str, id_col: str, int_col: str) -> pd.Series:
-        """Return a `pd.Series` mapping string id to int id for `table`."""
+        """Return a `pd.Series` mapping string id to int id for `table`.
+
+        Parameters
+        ----------
+        table : str
+            Table to read the id mapping from.
+        id_col : str
+            The stable string id column of `table`.
+        int_col : str
+            The integer surrogate id column of `table`.
+
+        Returns
+        -------
+        pd.Series
+            Indexed by `id_col`, valued by `int_col`.
+        """
         df = self.con.table(table).select(id_col, int_col).to_pandas()
         return df.set_index(id_col)[int_col]
 
@@ -471,15 +527,33 @@ class IMDB:
     # ---- read -------------------------------------------------------------
 
     def get_events(self) -> pd.DataFrame:
-        """Return all events, indexed by `event_id`."""
+        """Return all events, indexed by `event_id`.
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per event.
+        """
         return self.con.table("events").to_pandas().set_index("event_id")
 
     def get_realisations(self) -> pd.DataFrame:
-        """Return all realisations, indexed by `rel_id`."""
+        """Return all realisations, indexed by `rel_id`.
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per realisation.
+        """
         return self.con.table("realisations").to_pandas().set_index("rel_id")
 
     def get_sites(self) -> pd.DataFrame:
-        """Return all sites, indexed by `site_id`."""
+        """Return all sites, indexed by `site_id`.
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per site.
+        """
         return self.con.table("sites").to_pandas().set_index("site_id")
 
     def get_site_event(

@@ -161,6 +161,242 @@ def test_get_site_event_filters(db):
     assert len(by_rrup) == 2
 
 
+def test_con_raises_when_not_open(tmp_path):
+    db = IMDB(tmp_path / "unopened.duckdb")
+    with pytest.raises(RuntimeError, match="not open"):
+        _ = db.con
+
+
+def test_context_manager(tmp_path):
+    path = tmp_path / "ctx.duckdb"
+    with IMDB.create(path, periods=[]) as db:
+        assert db.con is not None
+    assert db._con is None
+
+
+def test_add_records_requires_kind_column(db):
+    with pytest.raises(ValueError, match="kind"):
+        db.add_records(
+            pd.DataFrame(
+                {
+                    "rel_id": ["eventA_rel0"],
+                    "site_id": ["siteA"],
+                    "component": ["000"],
+                }
+            )
+        )
+
+
+def test_add_records_rejects_unknown_component(db):
+    with pytest.raises(ValueError, match="components not in this database"):
+        db.add_records(
+            pd.DataFrame(
+                {
+                    "rel_id": ["eventA_rel0"],
+                    "site_id": ["siteA"],
+                    "component": ["ver"],
+                    "kind": ["observed"],
+                }
+            )
+        )
+
+
+def test_add_records_rejects_bad_psa_shape(db):
+    with pytest.raises(ValueError, match="pSA must have one row per record"):
+        db.add_records(
+            pd.DataFrame(
+                {
+                    "rel_id": ["eventA_rel0"],
+                    "site_id": ["siteA"],
+                    "component": ["000"],
+                    "kind": ["observed"],
+                }
+            ),
+            pSA=np.zeros((2, len(PERIODS))),
+        )
+
+
+def test_add_records_rejects_bad_fas_shape(db):
+    with pytest.raises(ValueError, match="FAS must have one row per record"):
+        db.add_records(
+            pd.DataFrame(
+                {
+                    "rel_id": ["eventA_rel0"],
+                    "site_id": ["siteA"],
+                    "component": ["000"],
+                    "kind": ["observed"],
+                }
+            ),
+            FAS=np.zeros((2, len(FREQUENCIES))),
+        )
+
+
+def test_add_records_rejects_psa_sigma_without_psa(db):
+    with pytest.raises(ValueError, match="pSA_sigma must match pSA"):
+        db.add_records(
+            pd.DataFrame(
+                {
+                    "rel_id": ["eventA_rel0"],
+                    "site_id": ["siteA"],
+                    "component": ["000"],
+                    "kind": ["observed"],
+                }
+            ),
+            pSA_sigma=np.zeros((1, len(PERIODS))),
+        )
+
+
+def test_add_records_rejects_fas_sigma_without_fas(db):
+    with pytest.raises(ValueError, match="FAS_sigma must match FAS"):
+        db.add_records(
+            pd.DataFrame(
+                {
+                    "rel_id": ["eventA_rel0"],
+                    "site_id": ["siteA"],
+                    "component": ["000"],
+                    "kind": ["observed"],
+                }
+            ),
+            FAS_sigma=np.zeros((1, len(FREQUENCIES))),
+        )
+
+
+def test_add_records_masks_rotd_sigma(tmp_path):
+    db = IMDB.create(tmp_path / "rotd_sigma.duckdb", periods=[], components=("rotd50",))
+    db.add_events(pd.DataFrame({"event_id": ["e1"]}))
+    db.add_realisations(pd.DataFrame({"rel_id": ["r1"], "event_id": ["e1"]}))
+    db.add_sites(pd.DataFrame({"site_id": ["s1"], "lat": [-43.5], "lon": [172.6]}))
+
+    db.add_records(
+        pd.DataFrame(
+            {
+                "rel_id": ["r1"],
+                "site_id": ["s1"],
+                "component": ["rotd50"],
+                "kind": ["gmm"],
+                "gmm_key": ["TestGMM2020"],
+                "PGA": [0.5],
+                "CAV": [1.2],
+                "CAV_sigma": [0.3],
+            }
+        )
+    )
+
+    scalars = db.get_scalars(ims=["PGA", "CAV"], sigma=True)
+    assert scalars["PGA"].iloc[0] == 0.5
+    assert pd.isna(scalars["CAV"].iloc[0])
+    assert pd.isna(scalars["CAV_sigma"].iloc[0])
+    db.close()
+
+
+def test_add_records_rolls_back_on_failure(db, monkeypatch):
+    def broken_insert(table, data):
+        if table == "scalars_ims":
+            raise RuntimeError("boom")
+        return real_insert(table, data)
+
+    real_insert = db.con.insert
+    monkeypatch.setattr(db.con, "insert", broken_insert)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        db.add_records(
+            pd.DataFrame(
+                {
+                    "rel_id": ["eventA_rel0"],
+                    "site_id": ["siteA"],
+                    "component": ["000"],
+                    "kind": ["observed"],
+                    "PGA": [0.5],
+                }
+            )
+        )
+
+    monkeypatch.undo()
+    assert len(db.get_records(rel_ids=["eventA_rel0"], site_ids=["siteA"])) == 2
+
+
+def test_validate_detects_duplicate_record_int_id(db):
+    some_id = db.get_records().index[0]
+    db.con.raw_sql(f"INSERT INTO psa_ims (record_int_id, pSA) VALUES ({some_id}, NULL)")
+    problems = db.validate()
+    assert any("record_int_id is not unique" in p for p in problems)
+
+
+def test_validate_detects_unknown_foreign_key(db):
+    db.con.raw_sql(
+        "INSERT INTO records (record_int_id, event_int_id, rel_int_id, site_int_id, "
+        "component, kind) VALUES (999999, 999999, 999999, 999999, '000', 'observed')"
+    )
+    problems = db.validate()
+    assert any("unknown event_int_id" in p for p in problems)
+
+
+def test_validate_detects_orphan_im_row(db):
+    db.con.raw_sql("INSERT INTO psa_ims (record_int_id, pSA) VALUES (999999, NULL)")
+    problems = db.validate()
+    assert any("psa_ims: 1 rows with an unknown record_int_id" in p for p in problems)
+
+
+def test_validate_detects_bad_gmm_key(db):
+    db.add_records(
+        pd.DataFrame(
+            {
+                "rel_id": ["eventA_rel0"],
+                "site_id": ["siteA"],
+                "component": ["000"],
+                "kind": ["observed"],
+                "gmm_key": ["shouldnt be set"],
+            }
+        )
+    )
+    problems = db.validate()
+    assert any("gmm_key inconsistent with kind" in p for p in problems)
+
+
+def test_get_sites(db):
+    sites = db.get_sites()
+    assert set(sites.index) == set(SITES)
+
+
+def test_get_site_event_filters_by_site_ids(db):
+    by_site = db.get_site_event(site_ids=["siteA"])
+    assert (by_site["site_id"] == "siteA").all()
+    assert len(by_site) == len(EVENTS)
+
+
+def test_get_records_filters(db):
+    by_rel = db.get_records(rel_ids=["eventA_rel0"])
+    assert (by_rel["rel_id"] == "eventA_rel0").all()
+
+    by_site = db.get_records(site_ids=["siteA"])
+    assert (by_site["site_id"] == "siteA").all()
+
+    by_component = db.get_records(component="000")
+    assert (by_component["component"] == "000").all()
+
+    db.add_records(
+        pd.DataFrame(
+            {
+                "rel_id": ["eventA_rel0"],
+                "site_id": ["siteA"],
+                "component": ["090"],
+                "kind": ["gmm"],
+                "gmm_key": ["TestGMM2020"],
+            }
+        )
+    )
+    by_gmm_key = db.get_records(gmm_key="TestGMM2020")
+    assert (by_gmm_key["gmm_key"] == "TestGMM2020").all()
+
+
+def test_get_psa_and_fas_sigma(db):
+    psa = db.get_psa(sigma=True)
+    assert all(f"{p}_sigma" in psa.columns for p in PERIODS)
+
+    fas = db.get_fas(sigma=True)
+    assert all(f"{f}_sigma" in fas.columns for f in FREQUENCIES)
+
+
 def test_rotd_component_nulls_undefined_scalars(tmp_path):
     db = IMDB.create(tmp_path / "rotd.duckdb", periods=[], components=("rotd50",))
     db.add_events(pd.DataFrame({"event_id": ["e1"]}))

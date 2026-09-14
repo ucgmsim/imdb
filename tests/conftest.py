@@ -8,7 +8,7 @@ from imdb import IMDB
 
 PERIODS = [0.1, 0.2, 0.5, 1.0, 2.0]
 FREQUENCIES = [1.0, 5.0, 10.0]
-COMPONENTS = ["000", "090"]
+COMPONENTS = ("000", "090")
 EVENTS = ["eventA", "eventB"]
 SITES = ["siteA", "siteB", "siteC"]
 
