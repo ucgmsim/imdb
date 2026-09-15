@@ -184,6 +184,7 @@ def process_fault(fault_name: str) -> FaultResult | None:
             x = 0.5 + rel["shypo"] / fault.length
             y = rel["dhypo"] / fault.width
             hypo_lat, hypo_lon, hypo_depth_m = fault.fault_coordinates_to_wgs_depth_coordinates(np.array([x, y]))
+            srfgen_seed = rel.get("srfgen_seed")
             realisations.append(
                 {
                     "rel_id": rel_id,
@@ -198,7 +199,7 @@ def process_fault(fault_name: str) -> FaultResult | None:
                             "shypo": rel["shypo"],
                             "dhypo": rel["dhypo"],
                             "seed": int(rel["seed"]),
-                            "srfgen_seed": int(rel["srfgen_seed"]),
+                            "srfgen_seed": None if pd.isna(srfgen_seed) else int(srfgen_seed),
                             "sdrop": rel["sdrop"],
                         }
                     ),
@@ -293,9 +294,6 @@ def process_fault(fault_name: str) -> FaultResult | None:
 
 
 def main(data: Path, db_path: Path, workers: int) -> None:
-    if db_path.exists():
-        raise FileExistsError(f"{db_path} already exists")
-
     sites_all = load_sites(data)
     nhm_faults = nhm.load_nhm(str(data / "NZ_FLTmodel_2010.txt"))
 
@@ -308,13 +306,26 @@ def main(data: Path, db_path: Path, workers: int) -> None:
             faults.append(fault_name)
 
     im_periods = discover_periods(data, faults[0])
-    db = IMDB.create(
-        db_path, periods=im_periods, components=["geom", "rotd50"], db_meta={"dataset_id": "nz_nshm_2010_fault_ims"}
-    )
+
+    if db_path.exists():
+        db = IMDB(db_path, read_only=False).open()
+        done_events = set(db.get_events().index)
+        skipped = [f for f in faults if f in done_events]
+        faults = [f for f in faults if f not in done_events]
+        if skipped:
+            print(f"resuming: skipping {len(skipped)} faults already in {db_path}")
+        sites_seen = set(db.get_sites().index)
+    else:
+        db = IMDB.create(
+            db_path,
+            periods=im_periods,
+            components=("geom", "rotd50"),
+            db_meta={"dataset_id": "nz_nshm_2010_fault_ims"},
+        )
+        sites_seen = set()
     # DuckDB defaults memory_limit to 80% of RAM; left alone its buffer pool grows with the
     # database and crowds out the worker processes. Capped, it spills to disk instead.
     db.con.raw_sql(f"PRAGMA memory_limit='{DB_MEMORY_LIMIT}'")
-    sites_seen: set[str] = set()
 
     # Keep only a small window of faults in flight. Pool.imap_unordered/submit-all run every
     # task as fast as the workers allow and buffer each finished result in the parent, with no
