@@ -7,12 +7,12 @@
 #     "tqdm",
 #     "qcore-utils",
 #     "source-modelling",
-#     "imdb",
+#     "ucgmsim-imdb",
 #     "oq-wrapper",
 # ]
 #
 # [tool.uv.sources]
-# imdb = { git = "ssh://git@github.com/ucgmsim/imdb.git", branch = "emp-gmm-support" }
+# ucgmsim-imdb = { git = "ssh://git@github.com/ucgmsim/imdb.git", branch = "emp-gmm-support" }
 # ///
 
 """Ingest NZ NSHM 2010 fault ruptures (source_data/im_data) into an IMDB.

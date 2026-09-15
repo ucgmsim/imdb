@@ -9,6 +9,14 @@ from imdb import IMDB
 from tests.conftest import COMPONENTS, EVENTS, FREQUENCIES, PERIODS, SITES
 
 
+def test_create_rejects_existing_path(tmp_path):
+    path = tmp_path / "existing.duckdb"
+    IMDB.create(path, periods=[]).close()
+
+    with pytest.raises(FileExistsError):
+        IMDB.create(path, periods=[])
+
+
 def test_round_trip(db):
     records = db.get_records()
     n = len(EVENTS) * 2 * len(SITES) * len(COMPONENTS)

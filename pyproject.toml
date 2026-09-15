@@ -3,7 +3,7 @@ requires = ["setuptools", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "imdb"
+name = "ucgmsim-imdb"
 authors = [{name="ucgmsim"}]
 description = "A library for reading and writing intensity measure databases"
 readme = "README.md"

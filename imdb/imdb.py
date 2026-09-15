@@ -133,6 +133,9 @@ class IMDB:
         IMDB
             The newly created database, open for writing.
         """
+        if Path(path).exists():
+            raise FileExistsError(f"{path} already exists")
+        
         frequencies = frequencies or []
         db = cls(path, read_only=False).open()
         con = db.con
