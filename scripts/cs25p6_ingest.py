@@ -185,6 +185,7 @@ def process_fault(fault_name: str) -> FaultResult | None:
             y = rel["dhypo"] / fault.width
             hypo_lat, hypo_lon, hypo_depth_m = fault.fault_coordinates_to_wgs_depth_coordinates(np.array([x, y]))
             srfgen_seed = rel.get("srfgen_seed")
+            sdrop = rel.get("sdrop")
             realisations.append(
                 {
                     "rel_id": rel_id,
@@ -200,7 +201,7 @@ def process_fault(fault_name: str) -> FaultResult | None:
                             "dhypo": rel["dhypo"],
                             "seed": int(rel["seed"]),
                             "srfgen_seed": None if pd.isna(srfgen_seed) else int(srfgen_seed),
-                            "sdrop": rel["sdrop"],
+                            "sdrop": None if pd.isna(sdrop) else sdrop,
                         }
                     ),
                 }
