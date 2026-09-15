@@ -336,11 +336,15 @@ class IMDB:
             raise ValueError("pSA must have one row per record")
         if FAS is not None and FAS.shape[0] != len(df):
             raise ValueError("FAS must have one row per record")
-        if pSA_sigma is not None and not (pSA is not None and pSA_sigma.shape == pSA.shape):
+        if pSA_sigma is not None and not (
+            pSA is not None and pSA_sigma.shape == pSA.shape
+        ):
             raise ValueError(
                 "pSA_sigma must match pSA's shape, and only be given together with pSA"
             )
-        if FAS_sigma is not None and not (FAS is not None and FAS_sigma.shape == FAS.shape):
+        if FAS_sigma is not None and not (
+            FAS is not None and FAS_sigma.shape == FAS.shape
+        ):
             raise ValueError(
                 "FAS_sigma must match FAS's shape, and only be given together with FAS"
             )
@@ -489,7 +493,11 @@ class IMDB:
 
         for table in ("psa_ims", "fas_ims", "scalars_ims"):
             t = self.con.table(table)
-            n = t.filter(~t.record_int_id.isin(records.record_int_id)).count().to_pandas()
+            n = (
+                t.filter(~t.record_int_id.isin(records.record_int_id))
+                .count()
+                .to_pandas()
+            )
             if n:
                 problems.append(f"{table}: {n} rows with an unknown record_int_id")
 

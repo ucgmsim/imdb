@@ -165,7 +165,9 @@ db.add_events(events_df)
 db.add_realisations(realisations_df)
 db.add_sites(sites_df)
 db.add_site_event(site_event_df)
-db.add_records(records_df)  # rel_id, site_id, component, kind, pSA, FAS, scalar IM columns
+db.add_records(
+    records_df
+)  # rel_id, site_id, component, kind, pSA, FAS, scalar IM columns
 db.validate()
 db.close()
 ```
