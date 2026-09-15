@@ -1,0 +1,19 @@
+name: Claude PR Review
+
+# Triggered by a "@claude review" comment on a pull request.
+#
+# Why issue_comment and not pull_request: GitHub withholds secrets from runs
+# triggered by fork pull requests, so a pull_request trigger would silently
+# fail on exactly the PRs that most need review. issue_comment runs in the base
+# repository's context with secrets available. The action independently checks
+# that the commenting user has write access before doing anything, so the gate
+# is "a member of this org asked for this review".
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  review:
+    uses: ucgmsim/meta-ci-action/.github/workflows/claude-review.yml@main
+    secrets:
+      claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
