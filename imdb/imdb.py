@@ -135,7 +135,7 @@ class IMDB:
         """
         if Path(path).exists():
             raise FileExistsError(f"{path} already exists")
-        
+
         frequencies = frequencies or []
         db = cls(path, read_only=False).open()
         con = db.con
@@ -172,7 +172,7 @@ class IMDB:
             "n_periods": str(len(periods)),
             "n_frequencies": str(len(frequencies)),
             "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
-            "imdb_version": version("imdb"),
+            "imdb_version": version("ucgmsim-imdb"),
             **(db_meta or {}),
         }
         con.insert(
