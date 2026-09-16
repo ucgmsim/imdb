@@ -130,13 +130,6 @@ IM_UNITS = {
     "Ds595": "s",
 }
 
-METADATA_TABLES = {
-    "events": "event_metadata_keys",
-    "realisations": "rel_metadata_keys",
-    "sites": "site_metadata_keys",
-    "site_event": "site_event_metadata_keys",
-}
-
 NOTES = {
     "logical keys": (
         "site_event's logical key is (site_int_id, event_int_id); records' logical key is "
@@ -181,8 +174,8 @@ NOTES = {
     ),
     "metadata columns are JSON": (
         "events, realisations, sites and site_event each carry a metadata VARCHAR holding a "
-        "JSON object. Read with json_extract_string(metadata, '$.key'). Permitted keys are "
-        "declared in db_meta and validated by the writer."
+        "JSON object. Read with json_extract_string(metadata, '$.key'). Keys are free-form, "
+        "per-dataset; not declared or validated by the writer."
     ),
     "distances are event level": (
         "rrup, rjb, rx and ry are measured to the rupture surface and are defined at the "

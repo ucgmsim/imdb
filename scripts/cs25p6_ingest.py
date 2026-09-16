@@ -349,15 +349,23 @@ def main(data: Path, db_path: Path, workers: int) -> None:
                 if result is None:
                     progress.update()
                     continue
-                db.add_events(pd.DataFrame([result.event]))
-                new_sites = sorted(set(result.event_sites) - sites_seen)
-                if new_sites:
-                    db.add_sites(sites_all.loc[new_sites].reset_index(names="site_id"))
-                    sites_seen.update(new_sites)
-                db.add_realisations(pd.DataFrame(result.realisations))
-                db.add_site_event(result.site_event_df)
-                db.add_records(result.records_df, pSA=result.psa)
-                db.add_records(result.gmm_df, pSA=result.gmm_psa, pSA_sigma=result.gmm_psa_sigma)
+                fault_name = result.event["event_id"]
+                try:
+                    db.add_events(pd.DataFrame([result.event]))
+                    new_sites = sorted(set(result.event_sites) - sites_seen)
+                    if new_sites:
+                        db.add_sites(sites_all.loc[new_sites].reset_index(names="site_id"))
+                        sites_seen.update(new_sites)
+                    db.add_realisations(pd.DataFrame(result.realisations))
+                    db.add_site_event(result.site_event_df)
+                    db.add_records(result.records_df, pSA=result.psa)
+                    db.add_records(result.gmm_df, pSA=result.gmm_psa, pSA_sigma=result.gmm_psa_sigma)
+                except Exception:
+                    # add_events already committed; without this, a rerun's done_events check
+                    # would see the event and skip it forever, leaving it permanently partial.
+                    print(f"ERROR: rolling back partial write for {fault_name}", flush=True)
+                    traceback.print_exc()
+                    db.delete_event(fault_name)
                 del result
                 progress.update()
             # A Future caches its result until collected, so drop the finished ones before

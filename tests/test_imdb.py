@@ -17,6 +17,13 @@ def test_create_rejects_existing_path(tmp_path):
         IMDB.create(path, periods=[])
 
 
+def test_create_db_meta_cannot_override_reserved_keys(tmp_path):
+    path = tmp_path / "reserved.duckdb"
+    db = IMDB.create(path, periods=[], db_meta={"schema_version": "stale"})
+    assert db.db_meta["schema_version"] == "1"
+    db.close()
+
+
 def test_round_trip(db):
     records = db.get_records()
     n = len(EVENTS) * 2 * len(SITES) * len(COMPONENTS)
@@ -124,6 +131,26 @@ def test_add_records_rejects_duplicate_of_existing_record(db):
         )
 
 
+def test_add_site_event_rejects_duplicate_within_df(db):
+    with pytest.raises(ValueError, match="duplicate"):
+        db.add_site_event(
+            pd.DataFrame(
+                {
+                    "site_id": ["siteA", "siteA"],
+                    "event_id": ["eventA", "eventA"],
+                    "rrup": [1.0, 1.0],
+                }
+            )
+        )
+
+
+def test_add_site_event_rejects_duplicate_of_existing_row(db):
+    with pytest.raises(ValueError, match="already exist"):
+        db.add_site_event(
+            pd.DataFrame({"site_id": ["siteA"], "event_id": ["eventA"], "rrup": [1.0]})
+        )
+
+
 def test_validate_catches_sigma_on_non_gmm_record(db):
     db.add_records(
         pd.DataFrame(
@@ -210,7 +237,7 @@ def test_add_records_rejects_unknown_component(db):
 
 
 def test_add_records_rejects_bad_psa_shape(db):
-    with pytest.raises(ValueError, match="pSA must have one row per record"):
+    with pytest.raises(ValueError, match="pSA must have shape"):
         db.add_records(
             pd.DataFrame(
                 {
@@ -225,7 +252,7 @@ def test_add_records_rejects_bad_psa_shape(db):
 
 
 def test_add_records_rejects_bad_fas_shape(db):
-    with pytest.raises(ValueError, match="FAS must have one row per record"):
+    with pytest.raises(ValueError, match="FAS must have shape"):
         db.add_records(
             pd.DataFrame(
                 {
@@ -236,6 +263,36 @@ def test_add_records_rejects_bad_fas_shape(db):
                 }
             ),
             FAS=np.zeros((2, len(FREQUENCIES))),
+        )
+
+
+def test_add_records_rejects_wrong_psa_grid_length(db):
+    with pytest.raises(ValueError, match="pSA must have shape"):
+        db.add_records(
+            pd.DataFrame(
+                {
+                    "rel_id": ["eventA_rel0"],
+                    "site_id": ["siteA"],
+                    "component": ["000"],
+                    "kind": ["observed"],
+                }
+            ),
+            pSA=np.zeros((1, len(PERIODS) - 1)),
+        )
+
+
+def test_add_records_rejects_wrong_fas_grid_length(db):
+    with pytest.raises(ValueError, match="FAS must have shape"):
+        db.add_records(
+            pd.DataFrame(
+                {
+                    "rel_id": ["eventA_rel0"],
+                    "site_id": ["siteA"],
+                    "component": ["000"],
+                    "kind": ["observed"],
+                }
+            ),
+            FAS=np.zeros((1, len(FREQUENCIES) - 1)),
         )
 
 

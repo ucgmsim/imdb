@@ -167,13 +167,13 @@ class IMDB:
         )
 
         meta = {
+            **(db_meta or {}),
             "schema_version": schema.SCHEMA_VERSION,
             "components": ",".join(components),
             "n_periods": str(len(periods)),
             "n_frequencies": str(len(frequencies)),
             "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
             "imdb_version": version("ucgmsim-imdb"),
-            **(db_meta or {}),
         }
         con.insert(
             "db_meta", pd.DataFrame({"key": meta.keys(), "value": meta.values()})
@@ -269,6 +269,12 @@ class IMDB:
         df : pd.DataFrame
             Must have `site_id` and `event_id` columns; other columns match
             `site_event`.
+
+        Raises
+        ------
+        ValueError
+            If `df` contains duplicate `(site_id, event_id)` rows, or any of them
+            already exist in this database.
         """
         df = df.copy()
         site_int_id = self._id_map("sites", "site_id", "site_int_id")
@@ -276,6 +282,25 @@ class IMDB:
         df["site_int_id"] = site_int_id.loc[df["site_id"]].to_numpy()
         df["event_int_id"] = event_int_id.loc[df["event_id"]].to_numpy()
         df = df.drop(columns=["site_id", "event_id"])
+
+        key_cols = ["site_int_id", "event_int_id"]
+        if df[key_cols].duplicated().any():
+            raise ValueError(
+                "df contains duplicate site-event rows (same site_id and event_id)"
+            )
+        existing = (
+            self.con.table("site_event")
+            .filter(_.event_int_id.isin(df["event_int_id"].unique()))
+            .select(*key_cols)
+            .to_pandas()
+        )
+        collisions = df[key_cols].merge(existing, on=key_cols, how="inner")
+        if not collisions.empty:
+            raise ValueError(
+                f"{len(collisions)} site-event row(s) already exist in this "
+                "database (same site_id and event_id)"
+            )
+
         self.con.insert("site_event", df)
 
     def add_records(
@@ -335,10 +360,12 @@ class IMDB:
         if unknown:
             raise ValueError(f"components not in this database: {sorted(unknown)}")
 
-        if pSA is not None and pSA.shape[0] != len(df):
-            raise ValueError("pSA must have one row per record")
-        if FAS is not None and FAS.shape[0] != len(df):
-            raise ValueError("FAS must have one row per record")
+        n_periods = int(self.db_meta["n_periods"])
+        n_frequencies = int(self.db_meta["n_frequencies"])
+        if pSA is not None and pSA.shape != (len(df), n_periods):
+            raise ValueError(f"pSA must have shape ({len(df)}, {n_periods})")
+        if FAS is not None and FAS.shape != (len(df), n_frequencies):
+            raise ValueError(f"FAS must have shape ({len(df)}, {n_frequencies})")
         if pSA_sigma is not None and not (
             pSA is not None and pSA_sigma.shape == pSA.shape
         ):
@@ -459,7 +486,6 @@ class IMDB:
             f"DELETE FROM records WHERE event_int_id = {event_int_id_subquery}",
             f"DELETE FROM site_event WHERE event_int_id = {event_int_id_subquery}",
             f"DELETE FROM realisations WHERE event_int_id = {event_int_id_subquery}",
-            ##  QUESTION:Why is this one a different style than the other deletes? Why not f string?
             "DELETE FROM events WHERE event_id = ?",
         ]
         for statement in statements:
