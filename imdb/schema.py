@@ -4,7 +4,7 @@ Facts only, no logic. `DDL` is the single source of truth for the schema; nothin
 else in this library composes column lists by hand.
 """
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 DDL = """
 CREATE TABLE db_meta  (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL);
@@ -63,6 +63,7 @@ CREATE TABLE sites (
     vs30        FLOAT,
     z1p0        FLOAT,
     z2p5        FLOAT,
+    is_real     BOOLEAN NOT NULL DEFAULT TRUE,
     metadata    VARCHAR
 );
 
@@ -176,6 +177,10 @@ NOTES = {
         "events, realisations, sites and site_event each carry a metadata VARCHAR holding a "
         "JSON object. Read with json_extract_string(metadata, '$.key'). Keys are free-form, "
         "per-dataset; not declared or validated by the writer."
+    ),
+    "is_real": (
+        "sites.is_real distinguishes real sites (station/grid locations, the default) from "
+        "virtual simulation sites."
     ),
     "distances are event level": (
         "rrup, rjb, rx and ry are measured to the rupture surface and are defined at the "
