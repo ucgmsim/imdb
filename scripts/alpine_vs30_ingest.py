@@ -7,6 +7,7 @@
 #     "h5py",
 #     "source-modelling",
 #     "ucgmsim-imdb",
+#     "oq-wrapper",
 # ]
 #
 # [tool.uv.sources]
@@ -18,7 +19,8 @@
 Each `<fault>_R<n>` folder under `data_dir` (fault in base/clarence/hope/wairau, n in
 1-3) is one realisation of the `fault` event. Source/rupture metadata comes from each
 folder's `realisation.json`; IM values come from `intensity_measures.site_table_vs30.h5`
-only (the grid_vs30 variant is not ingested).
+only (the grid_vs30 variant is not ingested). Empirical NSHM2022 pSA GMM predictions are
+computed per event from `oq_wrapper` and ingested alongside the simulated records.
 """
 
 import argparse
@@ -27,6 +29,7 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+import oq_wrapper as oqw
 import pandas as pd
 from imdb import IMDB, schema
 from source_modelling import moment
@@ -35,6 +38,7 @@ from source_modelling.sources import Fault
 FAULTS = ["base", "clarence", "hope", "wairau"]
 REL_NUMBERS = [1, 2, 3]
 SCALAR_IMS = ["PGA", "PGV", "CAV", "AI", "Ds575", "Ds595"]
+DEFAULT_SITE_TABLE = Path("/Users/claudy/dev/work/data/gm_datasets/nz_gmdb/v4.3_final/Tables/site_table.csv")
 
 
 def _decode(values: np.ndarray) -> list[str]:
@@ -53,8 +57,12 @@ def load_realisation(data_dir: Path, fault: str, n: int) -> dict:
     return json.loads((rel_dir(data_dir, fault, n) / "realisation.json").read_text())
 
 
-def load_sites(data_dir: Path) -> pd.DataFrame:
-    """Site table: lat/lon from the h5, vs30 from vs30_comparison.csv, built once globally."""
+def load_sites(data_dir: Path, site_table_path: Path) -> pd.DataFrame:
+    """Site table: lat/lon from the h5, vs30 from vs30_comparison.csv, built once globally.
+
+    z1p0/z2p5 come from the NZ GMDB site table (not present anywhere in this dataset) —
+    required for the empirical GMM logic tree, not just informational.
+    """
     frames = []
     for fault in FAULTS:
         for n in REL_NUMBERS:
@@ -82,7 +90,16 @@ def load_sites(data_dir: Path) -> pd.DataFrame:
 
     sites = all_sites.drop_duplicates("site_id").reset_index(drop=True)
     sites["is_real"] = True
-    return sites
+
+    # Z1.0 in the GMDB table is metres, Z2.5 is already km (verified: Z2.5 > Z1.0/1000 for every station).
+    z_table = pd.read_csv(site_table_path, usecols=["sta", "Z1.0", "Z2.5"]).rename(columns={"sta": "site_id"})
+    sites = sites.merge(z_table, on="site_id", how="left")
+    missing = sites.loc[sites["Z1.0"].isna() | sites["Z2.5"].isna(), "site_id"].tolist()
+    if missing:
+        raise ValueError(f"Missing Z1.0/Z2.5 in {site_table_path} for stations: {missing}")
+    sites["z1p0"] = sites["Z1.0"] / 1000
+    sites["z2p5"] = sites["Z2.5"]
+    return sites.drop(columns=["Z1.0", "Z2.5"])
 
 
 def fault_geometries(realisation: dict) -> dict[str, Fault]:
@@ -190,6 +207,73 @@ def build_realisation(fault: str, n: int, geometries: dict[str, Fault], realisat
     }
 
 
+def build_gmm_records(
+    ref_fault: Fault,
+    site_event_df: pd.DataFrame,
+    sites: pd.DataFrame,
+    realisations: list[dict],
+    periods: list[float],
+) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+    """NSHM2022 empirical pSA logic tree, one call per event covering all its realisations.
+
+    dip/ztor/zbot/rx/ry have no single well-defined value for a cascading multi-segment
+    rupture, so they're approximated from the initiating segment (`ref_fault`) — the same
+    segment already used for rake/hypocentre in `build_realisation`. rrup/rjb stay the
+    physically-correct min-across-segments values already computed in `site_event_df`.
+    """
+    latlon = sites[["lat", "lon"]].to_numpy()
+    rx, ry = ref_fault.rx_ry_distance(latlon)
+    site_geom = pd.DataFrame(
+        {
+            "site_id": sites["site_id"],
+            "vs30": sites["vs30"],
+            "z1pt0": sites["z1p0"],
+            "z2pt5": sites["z2p5"],
+            "rx": np.asarray(rx) / 1000,
+            "ry": np.asarray(ry) / 1000,
+        }
+    ).merge(site_event_df[["site_id", "rrup", "rjb"]], on="site_id")
+
+    rupture_df = pd.concat(
+        [
+            site_geom.assign(rel_id=rel["rel_id"], mag=rel["magnitude"], rake=rel["rake"], hypo_depth=rel["hypo_depth"])
+            for rel in realisations
+        ],
+        ignore_index=True,
+    )
+    rupture_df["dip"] = ref_fault.dip
+    rupture_df["ztor"] = ref_fault.top_m / 1000
+    rupture_df["zbot"] = ref_fault.bottom_m / 1000
+    rupture_df["vs30measured"] = True
+    rupture_df["backarc"] = False
+
+    # GMMs in this logic tree only cover periods up to 10s; beyond that oq_wrapper would
+    # extrapolate (and warn per call), which isn't a real prediction, so don't ask for it.
+    in_range = [p for p in periods if p <= 10]
+    result = oqw.run_gmm_logic_tree(
+        oqw.constants.GMMLogicTree.NSHM2022,
+        oqw.constants.TectType["ACTIVE_SHALLOW"],
+        rupture_df,
+        "pSA",
+        periods=in_range,
+    )
+    gmm_df = pd.DataFrame(
+        {
+            "rel_id": rupture_df["rel_id"],
+            "site_id": rupture_df["site_id"],
+            "component": "rotd50",
+            "kind": "gmm",
+            "gmm_key": "NSHM2022",
+        }
+    )
+    psa = np.full((len(rupture_df), len(periods)), np.nan, dtype=np.float32)
+    psa_sigma = np.full((len(rupture_df), len(periods)), np.nan, dtype=np.float32)
+    in_range_cols = [i for i, p in enumerate(periods) if p <= 10]
+    psa[:, in_range_cols] = np.exp(result[[f"pSA_{p}_mean" for p in in_range]].to_numpy(dtype=np.float32))
+    psa_sigma[:, in_range_cols] = result[[f"pSA_{p}_std_Total" for p in in_range]].to_numpy(dtype=np.float32)
+    return gmm_df, psa, psa_sigma
+
+
 def build_records(fault: str, n: int, data_dir: Path) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
     with h5py.File(h5_path(data_dir, fault, n)) as h5:
         stations = _decode(h5["station"][:])
@@ -213,8 +297,8 @@ def build_records(fault: str, n: int, data_dir: Path) -> tuple[pd.DataFrame, np.
     return records_df, psa_arr, fas_arr
 
 
-def main(data_dir: Path, db_path: Path) -> None:
-    sites = load_sites(data_dir)
+def main(data_dir: Path, db_path: Path, site_table_path: Path) -> None:
+    sites = load_sites(data_dir, site_table_path)
 
     with h5py.File(h5_path(data_dir, FAULTS[0], 1)) as h5:
         periods = h5["period"][:].tolist()
@@ -232,8 +316,11 @@ def main(data_dir: Path, db_path: Path) -> None:
     for fault in FAULTS:
         event_realisation = load_realisation(data_dir, fault, 1)
         event, geometries = build_event(fault, event_realisation)
+        causality_tree = event_realisation["rupture_propagation"]["rupture_causality_tree"]
+        ref_fault = geometries[initial_fault_name(causality_tree)]
         db.add_events(pd.DataFrame([event]))
-        db.add_site_event(build_site_event(fault, geometries, sites))
+        site_event_df = build_site_event(fault, geometries, sites)
+        db.add_site_event(site_event_df)
 
         realisations = []
         for n in REL_NUMBERS:
@@ -242,6 +329,9 @@ def main(data_dir: Path, db_path: Path) -> None:
                 assert h5["frequency"][:].tolist() == frequencies, f"{fault}_R{n}: frequency grid mismatch"
             realisations.append(build_realisation(fault, n, geometries, load_realisation(data_dir, fault, n)))
         db.add_realisations(pd.DataFrame(realisations))
+
+        gmm_df, psa, psa_sigma = build_gmm_records(ref_fault, site_event_df, sites, realisations, periods)
+        db.add_records(gmm_df, pSA=psa, pSA_sigma=psa_sigma)
 
         for n in REL_NUMBERS:
             records_df, psa_arr, fas_arr = build_records(fault, n, data_dir)
@@ -261,5 +351,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("data_dir", type=Path, help="vs30_site_table_update/ directory")
     parser.add_argument("db_path", type=Path, help="Output IMDB path")
+    parser.add_argument(
+        "--site-table",
+        type=Path,
+        default=DEFAULT_SITE_TABLE,
+        help="NZ GMDB site_table.csv, source of Z1.0/Z2.5 (not present in data_dir)",
+    )
     args = parser.parse_args()
-    main(args.data_dir, args.db_path)
+    main(args.data_dir, args.db_path, args.site_table)
