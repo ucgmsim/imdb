@@ -111,7 +111,7 @@ CREATE TABLE scalars_ims (
 );
 """
 
-COMPONENTS = ("000", "090", "ver", "geom", "rotd0", "rotd50", "rotd100")
+COMPONENTS = ("000", "090", "ver", "geom", "rotd0", "rotd50", "rotd100", "eas")
 
 SCALAR_IMS = ("PGA", "PGV", "PGD", "CAV", "AI", "Ds575", "Ds595")
 
@@ -157,9 +157,9 @@ NOTES = {
         "(rel_id, site_id, component, kind, gmm_key)."
     ),
     "component vocabulary": (
-        "000, 090, ver, geom, rotd0, rotd50, rotd100, following IM_calculation. A database "
-        "may hold any subset; db_meta.components lists which. The writer validates against "
-        "that list."
+        "000, 090, ver, geom, rotd0, rotd50, rotd100, following IM_calculation, plus eas "
+        "(effective amplitude spectrum, FAS only). A database may hold any subset; "
+        "db_meta.components lists which. The writer validates against that list."
     ),
     "rotd scalars are undefined": (
         "scalars_ims.CAV, AI, Ds575 and Ds595 are NULL for rotd* components. PGA, PGV and "

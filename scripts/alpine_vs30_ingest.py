@@ -74,7 +74,15 @@ def load_sites(data_dir: Path, site_table_path: Path) -> pd.DataFrame:
                 rel_dir(data_dir, fault, n) / "vs30_comparison.csv",
                 usecols=["station", "vs30_site_table"],
             ).rename(columns={"station": "site_id", "vs30_site_table": "vs30"})
-            frames.append(pd.DataFrame({"site_id": stations, "lat": lat, "lon": lon}).merge(vs30_df, on="site_id"))
+            frame = pd.DataFrame({"site_id": stations, "lat": lat, "lon": lon}).merge(
+                vs30_df, on="site_id", how="left"
+            )
+            missing_vs30 = frame.loc[frame["vs30"].isna(), "site_id"].tolist()
+            if missing_vs30:
+                raise ValueError(
+                    f"{fault}_R{n}: stations missing from vs30_comparison.csv: {missing_vs30}"
+                )
+            frames.append(frame)
     all_sites = pd.concat(frames, ignore_index=True)
 
     rounded = all_sites.assign(
