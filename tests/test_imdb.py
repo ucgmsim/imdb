@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from imdb import IMDB
+from imdb import IMDB, schema
 from tests.conftest import COMPONENTS, EVENTS, FREQUENCIES, PERIODS, SITES
 
 
@@ -20,7 +20,7 @@ def test_create_rejects_existing_path(tmp_path):
 def test_create_db_meta_cannot_override_reserved_keys(tmp_path):
     path = tmp_path / "reserved.duckdb"
     db = IMDB.create(path, periods=[], db_meta={"schema_version": "stale"})
-    assert db.db_meta["schema_version"] == "1"
+    assert db.db_meta["schema_version"] == schema.SCHEMA_VERSION
     db.close()
 
 
