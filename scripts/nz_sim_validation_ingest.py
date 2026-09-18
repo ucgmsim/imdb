@@ -4,7 +4,7 @@
 # dependencies = [
 #     "numpy>=2",
 #     "pandas>=3",
-#     "h5py",
+#     "h5py>=3.11",
 #     "source-modelling",
 #     "ucgmsim-imdb>=2026.9.2",
 # ]
