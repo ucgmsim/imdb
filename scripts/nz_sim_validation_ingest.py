@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.12"
+# requires-python = ">=3.12,<3.14"  # fiona (via source-modelling) has no 3.14 wheel yet
 # dependencies = [
 #     "numpy>=2",
 #     "pandas>=3",
@@ -8,11 +8,14 @@
 #     "source-modelling",
 #     "ucgmsim-imdb>=2026.9.2",
 # ]
+#
+# [tool.uv]
+# python-preference = "only-managed"  # avoid a broken/non-standard system Python on PATH
 # ///
 
 """Ingest Felipe's NZ sim-validation database into an IMDB.
 
-Each `results/<event_id>/` folder under `data_dir` is one real historical NZ
+Each `<event_id>/` folder under `data_dir` is one real historical NZ
 earthquake (event_id is a GeoNet CMT-style id, e.g. `2012p001887`), a single
 realisation (no `_R<n>` split), source/rupture metadata from `realisation.json`,
 simulated IMs from `intensity_measures.h5`. Observed records for the same events
@@ -39,11 +42,11 @@ def _decode(values: np.ndarray) -> list[str]:
 
 
 def event_ids(data_dir: Path) -> list[str]:
-    return sorted(p.name for p in (data_dir / "results").iterdir() if p.is_dir())
+    return sorted(p.name for p in data_dir.iterdir() if p.is_dir())
 
 
 def event_dir(data_dir: Path, event_id: str) -> Path:
-    return data_dir / "results" / event_id
+    return data_dir / event_id
 
 
 def h5_path(data_dir: Path, event_id: str) -> Path:
@@ -385,7 +388,7 @@ def main(data_dir: Path, gmdb_dir: Path, db_path: Path) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("data_dir", type=Path, help="Felipe_sim_validation_database/2026-06-24_runs_v8/ directory")
+    parser.add_argument("data_dir", type=Path, help="2026-06-24_runs_v8/results/ directory, containing one folder per event_id")
     parser.add_argument("gmdb_dir", type=Path, help="NZ GMDB v4.3_final/Tables directory")
     parser.add_argument("db_path", type=Path, help="Output IMDB path")
     args = parser.parse_args()
