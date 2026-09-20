@@ -38,6 +38,12 @@ from source_modelling.sources import Fault
 
 GMDB_TABLES = ("rotd50", "geom", "eas")
 
+TABLE_ORDER = (
+    "db_meta", "notes", "im_units", "periods", "frequencies",
+    "events", "realisations", "sites", "site_event", "records",
+    "psa_ims", "fas_ims", "scalars_ims",
+)
+
 
 def _decode(values: np.ndarray) -> list[str]:
     return [v.decode() if isinstance(v, bytes) else v for v in values]
@@ -340,6 +346,24 @@ def build_observed_records_eas(event_id: str, df: pd.DataFrame, frequencies: lis
     return records_df, fas_arr
 
 
+def flush_to_disk(db: IMDB, db_path: Path) -> None:
+    """Copy the in-memory database out to `db_path`, in FK-safe table order.
+
+    `COPY FROM DATABASE` doesn't respect foreign-key dependency order, so tables
+    are created and copied one at a time instead.
+    """
+    con = db.con
+    con.raw_sql(f"ATTACH '{db_path}' AS disk_db")
+    con.raw_sql("USE disk_db")
+    for statement in schema.DDL.strip().split(";"):
+        if statement.strip():
+            con.raw_sql(statement)
+    con.raw_sql("USE memory")
+    for table in TABLE_ORDER:
+        con.raw_sql(f"INSERT INTO disk_db.{table} SELECT * FROM memory.{table}")
+    con.raw_sql("DETACH disk_db")
+
+
 def main(data_dir: Path, gmdb_dir: Path, db_path: Path) -> None:
     ids = event_ids(data_dir)
 
@@ -352,7 +376,7 @@ def main(data_dir: Path, gmdb_dir: Path, db_path: Path) -> None:
         frequencies = h5["frequency"][:].tolist()
 
     db = IMDB.create(
-        db_path,
+        ":memory:",
         periods=periods,
         frequencies=frequencies,
         components=schema.COMPONENTS,
@@ -404,6 +428,7 @@ def main(data_dir: Path, gmdb_dir: Path, db_path: Path) -> None:
     print("sites:", len(db.get_sites()))
     print("records by kind:")
     print(db.get_records()["kind"].value_counts())
+    flush_to_disk(db, db_path)
     db.close()
 
 
