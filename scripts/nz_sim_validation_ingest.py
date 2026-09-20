@@ -5,6 +5,7 @@
 #     "numpy>=2",
 #     "pandas>=3",
 #     "h5py>=3.11",
+#     "shapely",
 #     "source-modelling",
 #     "ucgmsim-imdb>=2026.9.2",
 # ]
@@ -31,6 +32,7 @@ import h5py
 import numpy as np
 import pandas as pd
 from imdb import IMDB, schema
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
 from source_modelling import moment
 from source_modelling.sources import Fault
 
@@ -68,6 +70,22 @@ def fault_geometries(realisation: dict) -> dict[str, Fault]:
 
 def initial_fault_name(causality_tree: dict[str, str | None]) -> str:
     return next(name for name, parent in causality_tree.items() if parent is None)
+
+
+def source_wkt(geometries: dict[str, Fault]) -> str:
+    planes = [plane for f in geometries.values() for plane in f.planes]
+    return MultiPolygon([Polygon(p.corners[:, [1, 0]]) for p in planes]).wkt
+
+
+def trace_wkt(geometries: dict[str, Fault]) -> str:
+    planes = [plane for f in geometries.values() for plane in f.planes]
+    return MultiLineString([LineString(p.corners[:2, [1, 0]]) for p in planes]).wkt
+
+
+def domain_wkt(realisation: dict) -> str:
+    corners = realisation["domain"]["domain"]
+    points = [(c["longitude"], c["latitude"]) for c in corners]
+    return Polygon(points).wkt
 
 
 def build_event(event_id: str, realisation: dict) -> tuple[dict, dict[str, Fault]]:
@@ -109,6 +127,9 @@ def build_event(event_id: str, realisation: dict) -> tuple[dict, dict[str, Fault
         "dtop": dtop,
         "dbottom": dbottom,
         "length": length,
+        "source_wkt": source_wkt(geometries),
+        "trace_wkt": trace_wkt(geometries),
+        "domain_wkt": domain_wkt(realisation),
         "metadata": json.dumps({"nshm_rupture_name": realisation["metadata"]["name"], "segments": segments}),
     }
     return event, geometries
