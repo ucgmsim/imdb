@@ -352,6 +352,8 @@ def flush_to_disk(db: IMDB, db_path: Path) -> None:
     `COPY FROM DATABASE` doesn't respect foreign-key dependency order, so tables
     are created and copied one at a time instead.
     """
+    if Path(db_path).exists():
+        raise FileExistsError(f"{db_path} already exists")
     con = db.con
     con.raw_sql(f"ATTACH '{db_path}' AS disk_db")
     con.raw_sql("USE disk_db")
