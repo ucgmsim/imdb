@@ -6,6 +6,11 @@ else in this library composes column lists by hand.
 
 SCHEMA_VERSION = "2"
 
+# Older `schema_version`s a database can still be opened *read-only* under,
+# besides `SCHEMA_VERSION` itself.
+# Writing (`read_only=False`) still requires an exact `SCHEMA_VERSION` match.
+READ_COMPATIBLE_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION, "1"})
+
 DDL = """
 CREATE TABLE db_meta  (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL);
 CREATE TABLE notes    (topic VARCHAR PRIMARY KEY, note VARCHAR NOT NULL);
