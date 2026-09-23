@@ -207,7 +207,7 @@ class Campaign:
     def realisation(self, original_id: str) -> dict:
         return json.loads(self.realisation_json(original_id).read_text())
 
-    def build(self) -> dict[str, int]:
+    def build(self, content=None) -> dict[str, int]:
         return ingest.build_database(
             self.manifest,
             self.stations_input,
@@ -215,6 +215,7 @@ class Campaign:
             self.out,
             harvested_at="2026-09-23T07:35:00Z",
             script_commit="abc123",
+            content=content or ingest.Content(),
         )
 
 
@@ -381,6 +382,7 @@ def test_row_counts_and_meta(campaign: Campaign):
         "records": 34,
         "psa_ims": 34,
         "scalars_ims": 34,
+        "fas_ims": 0,
     }
     assert campaign.out.exists()
     assert not campaign.out.with_name("out.duckdb.partial").exists()
@@ -391,6 +393,8 @@ def test_row_counts_and_meta(campaign: Campaign):
     assert meta["components"] == "geom,rotd50"
     assert meta["n_periods"] == "25"
     assert meta["n_frequencies"] == "0"
+    assert meta["psa_period_selection"].startswith("25 of im-calc's 111 periods")
+    assert meta["fas"] == "not included"
     assert meta["n_realisations"] == "5"
     assert meta["n_pilot_realisations"] == "2"
     assert meta["im_calc_harvested_at"] == "2026-09-23T07:35:00Z"
@@ -635,3 +639,86 @@ def test_nshm_attributes_from_another_release_are_refused(campaign: Campaign):
 def test_nan_in_a_dropped_period_is_ignored(campaign: Campaign):
     _edit_h5(campaign.h5("288271/R2"), "geom", (0, DROPPED_COLUMN), np.nan, ("pSA",))
     assert campaign.build()["records"] == 34
+
+
+# ---- content options -------------------------------------------------------------
+
+EVERYTHING = ingest.Content(
+    components=("000", "090", "ver", "geom", "rotd0", "rotd50", "rotd100", "eas"),
+    all_periods=True,
+    fas=True,
+)
+
+
+def test_default_content():
+    content = ingest.Content()
+    assert content.components == ("geom", "rotd50")
+    assert content.psa_components == ("geom", "rotd50")
+    assert content.fas_components == ()
+    assert EVERYTHING.psa_components == ("000", "090", "ver", "geom", "rotd0", "rotd50", "rotd100")
+    assert EVERYTHING.fas_components == ("000", "090", "ver", "geom", "eas")
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"components": ("geom", "eas")}, "eas has only FAS"),
+        ({"components": ("geom", "rotd90")}, "unknown components"),
+        ({"components": ("geom", "geom")}, "listed twice"),
+        ({"components": ()}, "no components"),
+    ],
+)
+def test_bad_content_is_refused(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        ingest.Content(**kwargs)
+
+
+def test_everything_on(campaign: Campaign):
+    n_stations = sum(len(stations) for stations in STATIONS.values())  # 17
+    counts = campaign.build(EVERYTHING)
+    assert counts == {
+        "events": 3,
+        "realisations": 5,
+        "sites": 5,
+        "site_event": 11,
+        "records": 8 * n_stations,
+        "psa_ims": 7 * n_stations,
+        "scalars_ims": 7 * n_stations,
+        "fas_ims": 5 * n_stations,
+    }
+    with IMDB(campaign.out) as db:
+        meta = db.db_meta
+        assert db.validate() == []
+        rel, site = "288271_R2", "2TfEMSL"
+        ids = {c: db.get_records(rel_ids=[rel], site_ids=[site], component=c).index[0] for c in EVERYTHING.components}
+        psa = db.get_psa(record_int_ids=list(ids.values()))
+        fas = db.get_fas(record_int_ids=list(ids.values()))
+        scalars = db.get_scalars(record_int_ids=list(ids.values()))
+    assert meta["components"] == "000,090,ver,geom,rotd0,rotd50,rotd100,eas"
+    assert meta["n_periods"] == "111"
+    assert meta["n_frequencies"] == "3"
+    assert meta["psa_period_selection"] == "all 111 of im-calc's periods, 0.01-20 s."
+    assert meta["fas"].startswith("all 3 of im-calc's FAS frequencies, 0.1-10 Hz, for 000, 090, ver, geom, eas")
+    with h5py.File(campaign.h5("288271")) as h5:
+        i = STATIONS["288271"].index(site)
+        np.testing.assert_array_equal(psa.loc[ids["090"]].to_numpy(dtype=np.float32), h5["pSA/090"][i].astype(np.float32))
+        np.testing.assert_array_equal(fas.loc[ids["000"]].to_numpy(dtype=np.float32), h5["FAS/000"][i].astype(np.float32))
+        np.testing.assert_array_equal(fas.loc[ids["eas"]].to_numpy(dtype=np.float32), h5["FAS/eas"][i].astype(np.float32))
+        assert np.float32(scalars.loc[ids["ver"], "CAV"]) == np.float32(h5["CAV/ver"][i])
+    assert ids["rotd50"] not in fas.index  # no rotd FAS
+    assert ids["eas"] not in psa.index and ids["eas"] not in scalars.index  # eas is FAS only
+    assert list(psa.columns) == [str(p) for p in VALID_PERIODS]
+
+
+def test_a_different_fas_grid_stops_the_build(campaign: Campaign):
+    with h5py.File(campaign.h5("288271"), "r+") as h5:
+        h5["FAS/frequency"][...] = np.array([0.1, 1.0, 20.0])
+    with pytest.raises(ValueError, match="FAS frequency grid differs"):
+        campaign.build(EVERYTHING)
+
+
+def test_a_different_period_grid_stops_an_all_periods_build(campaign: Campaign):
+    with h5py.File(campaign.h5("288271"), "r+") as h5:
+        h5["pSA/period"][0] = 0.015
+    with pytest.raises(ValueError, match="0.01 s matches 0"):
+        campaign.build(ingest.Content(all_periods=True))

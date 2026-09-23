@@ -43,8 +43,9 @@ An event's geometry, and the distances stored for it, come from its first main
 realisation, or from the pilot where the main campaign has none. At a site only
 the pilot covers, site_event holds the pilot's distances, flagged in its metadata.
 
-Trimmed for size: only the geom and rotd50 components, pSA on 25 of im-calc's
-111 periods, and no FAS or empirical-GMM records.
+Trimmed for size by default: only the geom and rotd50 components, pSA on 25 of
+im-calc's 111 periods, and no FAS. --components, --psa-periods all and --fas
+put the rest in. Empirical-GMM records are never included.
 
 Every magnitude is BoldM (Hanks & Kanamori 1979 eq. 7), the group convention.
 nz_sim_validation_ingest.py converts to Mw instead.
@@ -74,7 +75,10 @@ PSA_PERIODS = (
     2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
     11.0, 12.0, 13.0, 14.0, 15.0, 20.0,
 )  # fmt: skip
-COMPONENTS = ("geom", "rotd50")
+DEFAULT_COMPONENTS = ("geom", "rotd50")
+# Components im-calc writes for pSA, PGA, PGV and PGD, and for FAS.
+PSA_COMPONENTS = ("000", "090", "ver", "geom", "rotd0", "rotd50", "rotd100")
+FAS_COMPONENTS = ("000", "090", "ver", "geom", "eas")
 N_IM_CALC_PERIODS = 111
 SITE_FIELDS = ("vs30", "z1pt0", "z2pt5")
 DISTANCE_FIELDS = ("rrup", "rjb", "rx", "ry")
@@ -136,10 +140,6 @@ DB_META = {
         "catalogue magnitude; realisations.magnitude is the realisation's own "
         "moment-summed total."
     ),
-    "psa_period_selection": (
-        "25 of im-calc's 111 periods: 0.1-1.0 s by 0.1 s, 2-15 s by 1 s, and 20 s. "
-        "im-calc computed no 16-19 s."
-    ),
     "station_coordinates": (
         "sites.lat/lon are the canonical stations_input.ll coordinates. The "
         "simulation snapped each station to its rupture's grid (~0.1 km away, so "
@@ -168,6 +168,78 @@ def select_period_indices(
             )
         indices.append(int(matches[0]))
     return np.array(indices)
+
+
+@dataclass(frozen=True)
+class Content:
+    """Which components, pSA periods and spectra go into the database."""
+
+    components: tuple[str, ...] = DEFAULT_COMPONENTS
+    all_periods: bool = False
+    """All 111 of im-calc's pSA periods, instead of the 25 in PSA_PERIODS."""
+    fas: bool = False
+    """FAS, on im-calc's full frequency grid, for the components that have it."""
+
+    def __post_init__(self) -> None:
+        if not self.components:
+            raise ValueError("no components chosen")
+        if len(set(self.components)) != len(self.components):
+            raise ValueError(f"components listed twice: {self.components}")
+        unknown = set(self.components) - set(PSA_COMPONENTS) - set(FAS_COMPONENTS)
+        if unknown:
+            raise ValueError(f"unknown components {sorted(unknown)}; choose from {schema.COMPONENTS}")
+        if "eas" in self.components and not self.fas:
+            raise ValueError("eas has only FAS, so it needs --fas")
+
+    @property
+    def psa_components(self) -> tuple[str, ...]:
+        """The chosen components that have pSA and the scalar IMs: all but eas."""
+        return tuple(c for c in self.components if c in PSA_COMPONENTS)
+
+    @property
+    def fas_components(self) -> tuple[str, ...]:
+        """The chosen components that get FAS: none without --fas."""
+        return tuple(c for c in self.components if self.fas and c in FAS_COMPONENTS)
+
+
+@dataclass(frozen=True)
+class Grids:
+    """The pSA periods and FAS frequencies the database is created with."""
+
+    periods: tuple[float, ...]
+    frequencies: tuple[float, ...]
+
+
+DEFAULT_CONTENT = Content()
+DEFAULT_GRIDS = Grids(periods=PSA_PERIODS, frequencies=())
+
+
+def read_grids(h5_path: Path, content: Content) -> Grids:
+    """The database's grids, taken from one realisation's h5 where the content needs its full grid."""
+    with h5py.File(h5_path, "r") as h5:
+        periods = tuple(float(p) for p in h5["pSA"]["period"][:]) if content.all_periods else PSA_PERIODS
+        frequencies = tuple(float(f) for f in h5["FAS"]["frequency"][:]) if content.fas else ()
+    return Grids(periods=periods, frequencies=frequencies)
+
+
+def content_meta(content: Content, grids: Grids) -> dict[str, str]:
+    """db_meta entries describing what the options put in."""
+    if content.all_periods:
+        periods = f"all {len(grids.periods)} of im-calc's periods, {min(grids.periods):g}-{max(grids.periods):g} s."
+    else:
+        periods = (
+            "25 of im-calc's 111 periods: 0.1-1.0 s by 0.1 s, 2-15 s by 1 s, and 20 s. "
+            "im-calc computed no 16-19 s."
+        )
+    if content.fas_components:
+        fas = (
+            f"all {len(grids.frequencies)} of im-calc's FAS frequencies, "
+            f"{min(grids.frequencies):g}-{max(grids.frequencies):g} Hz, for "
+            f"{', '.join(content.fas_components)}. rotd components have no FAS."
+        )
+    else:
+        fas = "not included"
+    return {"psa_period_selection": periods, "fas": fas}
 
 
 def rel_id(event_id: str, n: int) -> str:
@@ -300,7 +372,11 @@ class RealisationIMs:
     distances: dict[str, np.ndarray]
     """DISTANCE_FIELDS per station, km."""
     psa: dict[str, np.ndarray]
-    """Component -> (n_stations, len(PSA_PERIODS)) float32."""
+    """Component -> (n_stations, n_periods) float32, for Content.psa_components."""
+    fas: dict[str, np.ndarray]
+    """Component -> (n_stations, n_frequencies) float32, for Content.fas_components."""
+    n_frequencies: int
+    """Length of the database's FAS grid; 0 without FAS."""
     scalars: dict[str, dict[str, np.ndarray]]
     """Scalar IM -> component -> (n_stations,) float32; rotd-undefined IMs omitted."""
     attrs: dict[str, float]
@@ -319,7 +395,9 @@ def _peak(values: np.ndarray, stations: np.ndarray) -> tuple[float, str]:
     return float(values[i]), station.decode() if isinstance(station, bytes) else str(station)
 
 
-def read_ims(h5_path: Path) -> RealisationIMs:
+def read_ims(
+    h5_path: Path, content: Content = DEFAULT_CONTENT, grids: Grids = DEFAULT_GRIDS
+) -> RealisationIMs:
     """Read the parts of one intensity_measures.h5 this database keeps."""
     with h5py.File(h5_path, "r") as h5:
         psa_group = h5["pSA"]
@@ -328,23 +406,33 @@ def read_ims(h5_path: Path) -> RealisationIMs:
             raise ValueError(
                 f"{h5_path}: {len(periods)} pSA periods, expected {N_IM_CALC_PERIODS}"
             )
-        columns = select_period_indices(periods)
+        columns = select_period_indices(periods, grids.periods)
         raw_stations = psa_group["station"][:]
         scalars: dict[str, dict[str, np.ndarray]] = {}
         for im in schema.SCALAR_IMS:
             if not np.array_equal(h5[im]["station"][:], raw_stations):
                 raise ValueError(f"{h5_path}: {im} lists stations in a different order from pSA")
             scalars[im] = {}
-            for component in COMPONENTS:
+            for component in content.psa_components:
                 if component in h5[im]:
                     scalars[im][component] = h5[im][component][:].astype(np.float32)
                 elif not (component.startswith("rotd") and im in schema.ROTD_UNDEFINED):
                     raise ValueError(f"{h5_path}: {im} has no {component} component")
+        fas: dict[str, np.ndarray] = {}
+        if content.fas:
+            fas_group = h5["FAS"]
+            if not np.array_equal(fas_group["frequency"][:], np.array(grids.frequencies)):
+                raise ValueError(f"{h5_path}: FAS frequency grid differs from the database's")
+            if not np.array_equal(fas_group["station"][:], raw_stations):
+                raise ValueError(f"{h5_path}: FAS lists stations in a different order from pSA")
+            fas = {c: fas_group[c][:].astype(np.float32) for c in content.fas_components}
         return RealisationIMs(
             stations=_decode(raw_stations),
             site={key: psa_group[key][:].astype(np.float64) for key in SITE_FIELDS},
             distances={key: psa_group[key][:].astype(np.float64) for key in DISTANCE_FIELDS},
-            psa={c: psa_group[c][:][:, columns].astype(np.float32) for c in COMPONENTS},
+            psa={c: psa_group[c][:][:, columns].astype(np.float32) for c in content.psa_components},
+            fas=fas,
+            n_frequencies=len(grids.frequencies),
             scalars=scalars,
             attrs={key: float(np.atleast_1d(h5.attrs[key])[0]) for key in TOLERANCES},
             peaks={im: _peak(h5[im]["geom"][:], raw_stations) for im in ("PGA", "PGV")},
@@ -355,6 +443,7 @@ def check_finite(rel: str, ims: RealisationIMs) -> None:
     """Raise if any kept IM, site or distance value is NaN or infinite."""
     arrays = {
         **{f"pSA/{c}": values for c, values in ims.psa.items()},
+        **{f"FAS/{c}": values for c, values in ims.fas.items()},
         **{f"{im}/{c}": values for im, by_c in ims.scalars.items() for c, values in by_c.items()},
         **ims.site,
         **ims.distances,
@@ -383,17 +472,35 @@ def check_matches_first_realisation(
                 )
 
 
-def build_records(rel: str, ims: RealisationIMs) -> tuple[pd.DataFrame, np.ndarray]:
-    """IMDB records (one per station and component) and their pSA rows."""
+Batch = tuple[pd.DataFrame, np.ndarray | None, np.ndarray | None]
+
+
+def build_records(rel: str, ims: RealisationIMs, content: Content = DEFAULT_CONTENT) -> list[Batch]:
+    """IMDB records (one per station and component), as add_records batches of (records, pSA, FAS).
+
+    `eas` has only FAS, so its records form a batch of their own with no pSA
+    and no scalar columns, and add_records writes no psa_ims or scalars_ims
+    rows for them. A rotd record's FAS row is all NaN, so it gets no fas_ims row.
+    """
     n = len(ims.stations)
     frames = []
-    for component in COMPONENTS:
+    for component in content.psa_components:
         frame = {"rel_id": rel, "site_id": ims.stations, "component": component, "kind": "simulated"}
         for im, by_component in ims.scalars.items():
             frame[im] = by_component.get(component, np.full(n, np.nan, dtype=np.float32))
         frames.append(pd.DataFrame(frame))
-    records = pd.concat(frames, ignore_index=True)
-    return records, np.concatenate([ims.psa[c] for c in COMPONENTS])
+    batches: list[Batch] = []
+    if frames:
+        psa = np.concatenate([ims.psa[c] for c in content.psa_components])
+        fas = None
+        if content.fas:
+            no_fas = np.full((n, ims.n_frequencies), np.nan, dtype=np.float32)
+            fas = np.concatenate([ims.fas.get(c, no_fas) for c in content.psa_components])
+        batches.append((pd.concat(frames, ignore_index=True), psa, fas))
+    if "eas" in content.fas_components:
+        eas = pd.DataFrame({"rel_id": rel, "site_id": ims.stations, "component": "eas", "kind": "simulated"})
+        batches.append((eas, None, ims.fas["eas"]))
+    return batches
 
 
 def _site_event_rows(event_id: str, stations: np.ndarray, distances: dict[str, np.ndarray], metadata: str | None) -> pd.DataFrame:
@@ -677,6 +784,8 @@ def check_flags(db: IMDB, n_flagged: int) -> None:
 def spot_check(
     db_path: Path,
     manifest: dict[str, ManifestRow],
+    content: Content = DEFAULT_CONTENT,
+    grids: Grids = DEFAULT_GRIDS,
     n_realisations: int = 25,
     per_realisation: int = 40,
     min_pilot: int = 5,
@@ -703,21 +812,33 @@ def spot_check(
             ids = sample.index.tolist()
             psa = db.get_psa(record_int_ids=ids)
             scalars = db.get_scalars(record_int_ids=ids)
-            ims = read_ims(manifest[rel].im_path)
+            fas = db.get_fas(record_int_ids=ids) if content.fas else None
+            ims = read_ims(manifest[rel].im_path, content, grids)
             row_of = {site: i for i, site in enumerate(ims.stations)}
             for record_int_id, record in sample.iterrows():
                 i, component = row_of[record["site_id"]], record["component"]
-                stored = psa.loc[record_int_id].to_numpy(dtype=np.float32)
-                if not np.array_equal(stored, ims.psa[component][i]):
-                    raise AssertionError(f"{rel} {record['site_id']} {component}: pSA differs from the h5")
-                for im in schema.SCALAR_IMS:
-                    value = scalars.loc[record_int_id, im]
-                    expected = ims.scalars[im].get(component)
-                    if expected is None:
-                        if not pd.isna(value):
-                            raise AssertionError(f"{rel} {record['site_id']} {component}: {im} should be NULL")
-                    elif np.float32(value) != expected[i]:
-                        raise AssertionError(f"{rel} {record['site_id']} {component}: {im} differs from the h5")
+                where = f"{rel} {record['site_id']} {component}"
+                if component in content.psa_components:
+                    stored = psa.loc[record_int_id].to_numpy(dtype=np.float32)
+                    if not np.array_equal(stored, ims.psa[component][i]):
+                        raise AssertionError(f"{where}: pSA differs from the h5")
+                    for im in schema.SCALAR_IMS:
+                        value = scalars.loc[record_int_id, im]
+                        expected = ims.scalars[im].get(component)
+                        if expected is None:
+                            if not pd.isna(value):
+                                raise AssertionError(f"{where}: {im} should be NULL")
+                        elif np.float32(value) != expected[i]:
+                            raise AssertionError(f"{where}: {im} differs from the h5")
+                elif record_int_id in psa.index or record_int_id in scalars.index:
+                    raise AssertionError(f"{where}: should have no pSA or scalar IMs")
+                if fas is not None:
+                    if component in content.fas_components:
+                        stored = fas.loc[record_int_id].to_numpy(dtype=np.float32)
+                        if not np.array_equal(stored, ims.fas[component][i]):
+                            raise AssertionError(f"{where}: FAS differs from the h5")
+                    elif record_int_id in fas.index:
+                        raise AssertionError(f"{where}: should have no FAS")
                 checked += 1
     return checked
 
@@ -743,6 +864,7 @@ def build_database(
     out_path: Path,
     harvested_at: str,
     script_commit: str,
+    content: Content = DEFAULT_CONTENT,
     memory_limit: str | None = None,
 ) -> dict[str, int]:
     """Build the database at out_path and return its table row counts.
@@ -766,12 +888,15 @@ def build_database(
     if missing:
         raise ValueError(f"ruptures missing from {nshm_csv}: {missing}")
 
+    grids = read_grids(rows[0].im_path, content)
     db = IMDB.create(
         partial,
-        periods=list(PSA_PERIODS),
-        components=COMPONENTS,
+        periods=list(grids.periods),
+        frequencies=list(grids.frequencies),
+        components=content.components,
         db_meta={
             **DB_META,
+            **content_meta(content, grids),
             "n_realisations": str(len(rows)),
             "n_pilot_realisations": str(sum(row.pilot for row in rows)),
             "im_calc_harvested_at": harvested_at,
@@ -779,7 +904,9 @@ def build_database(
             "ingest_script_commit": script_commit,
         },
     )
-    counts = dict.fromkeys(("events", "realisations", "sites", "site_event", "records"), 0)
+    counts = dict.fromkeys(
+        ("events", "realisations", "sites", "site_event", "records", "psa_ims", "scalars_ims", "fas_ims"), 0
+    )
     n_flagged = 0
     seeds_seen: dict[str, str] = {}
     peaks: list[tuple[ManifestRow, dict[str, tuple[float, str]]]] = []
@@ -799,7 +926,7 @@ def build_database(
                 if seeds in seeds_seen:
                     raise ValueError(f"{row.label}: the same seeds as {seeds_seen[seeds]}")
                 seeds_seen[seeds] = row.rel_id
-                ims = read_ims(row.im_path)
+                ims = read_ims(row.im_path, content, grids)
                 check_finite(row.label, ims)
                 loaded.append(Loaded(row, realisation, ims))
                 peaks.append((row, ims.peaks))
@@ -833,9 +960,13 @@ def build_database(
                 db.add_sites(new_sites)
             db.add_site_event(site_event)
             for x in loaded:
-                records, psa = build_records(x.row.rel_id, x.ims)
-                db.add_records(records, pSA=psa)
-                counts["records"] += len(records)
+                for records, psa, fas in build_records(x.row.rel_id, x.ims, content):
+                    db.add_records(records, pSA=psa, FAS=fas)
+                n = len(x.ims.stations)
+                counts["records"] += n * len(content.components)
+                counts["psa_ims"] += n * len(content.psa_components)
+                counts["scalars_ims"] += n * len(content.psa_components)
+                counts["fas_ims"] += n * len(content.fas_components)
 
             counts["events"] += 1
             counts["realisations"] += len(loaded)
@@ -852,13 +983,12 @@ def build_database(
         problems = db.validate()
         if problems:
             raise RuntimeError(f"validate(): {problems}")
-        expected = {**counts, "psa_ims": counts["records"], "scalars_ims": counts["records"]}
-        check_row_counts(db, expected)
+        check_row_counts(db, counts)
         check_flags(db, n_flagged)
     finally:
         db.close()
 
-    checked = spot_check(partial, {row.rel_id: row for row in rows})
+    checked = spot_check(partial, {row.rel_id: row for row in rows}, content, grids)
     print(
         f"validate() clean; row counts match; {n_flagged} site_event rows carry the "
         f"pilot's distances; spot check: {checked} records identical to their h5",
@@ -866,7 +996,7 @@ def build_database(
     )
     print_peaks(peaks)
     partial.rename(out_path)
-    return expected
+    return counts
 
 
 def main() -> None:
@@ -880,13 +1010,30 @@ def main() -> None:
     parser.add_argument("--harvested-at", required=True, help="when the manifest was built from cylc, UTC ISO 8601")
     parser.add_argument("--script-commit", required=True, help="git commit of this script, for db_meta")
     parser.add_argument(
+        "--components",
+        default=",".join(DEFAULT_COMPONENTS),
+        help=f"comma-separated, from {','.join(schema.COMPONENTS)}; eas needs --fas (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--psa-periods",
+        choices=("default", "all"),
+        default="default",
+        help="default: the 25 in PSA_PERIODS; all: every one of im-calc's 111",
+    )
+    parser.add_argument("--fas", action="store_true", help="add FAS on im-calc's full frequency grid")
+    parser.add_argument(
         "--memory-limit",
         help="DuckDB memory_limit, e.g. 12GB. Without it DuckDB sizes itself from "
         "the node's RAM, not the job's memory allocation.",
     )
     args = parser.parse_args()
+    content = Content(
+        components=tuple(args.components.split(",")),
+        all_periods=args.psa_periods == "all",
+        fas=args.fas,
+    )
 
-    print(f"ingesting {args.manifest} into {args.out}", flush=True)
+    print(f"ingesting {args.manifest} into {args.out}: {content}", flush=True)
     counts = build_database(
         args.manifest,
         args.stations_input,
@@ -894,6 +1041,7 @@ def main() -> None:
         args.out,
         harvested_at=args.harvested_at,
         script_commit=args.script_commit,
+        content=content,
         memory_limit=args.memory_limit,
     )
     print("row counts:", counts)
