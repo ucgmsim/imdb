@@ -103,6 +103,36 @@ def test_schema_version_mismatch_rejected(db):
         IMDB(path, read_only=True).open()
 
 
+def test_read_compatible_schema_versions_includes_current_and_v1():
+    assert schema.SCHEMA_VERSION in schema.READ_COMPATIBLE_SCHEMA_VERSIONS
+    assert "1" in schema.READ_COMPATIBLE_SCHEMA_VERSIONS
+
+
+def test_read_only_open_accepts_compatible_old_schema_version(db):
+    path = db.path
+    db.close()
+
+    con = ibis.duckdb.connect(path, read_only=False)
+    con.raw_sql("UPDATE db_meta SET value = '1' WHERE key = 'schema_version'")
+    con.disconnect()
+
+    with IMDB(path, read_only=True) as reopened:
+        assert reopened.db_meta["schema_version"] == "1"
+        assert len(reopened.get_events()) == 2
+
+
+def test_read_write_open_rejects_old_schema_version_even_if_read_compatible(db):
+    path = db.path
+    db.close()
+
+    con = ibis.duckdb.connect(path, read_only=False)
+    con.raw_sql("UPDATE db_meta SET value = '1' WHERE key = 'schema_version'")
+    con.disconnect()
+
+    with pytest.raises(RuntimeError, match="schema version"):
+        IMDB(path, read_only=False).open()
+
+
 def test_add_records_rejects_duplicate_within_df(db):
     with pytest.raises(ValueError, match="duplicate"):
         db.add_records(

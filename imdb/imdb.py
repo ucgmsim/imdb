@@ -60,20 +60,35 @@ class IMDB:
     def open(self) -> Self:
         """Open the database connection, if not already open.
 
+        Read-only allows any version in `schema.READ_COMPATIBLE_SCHEMA_VERSIONS`;
+        read-write requires an exact match with `schema.SCHEMA_VERSION`.
+
         Returns
         -------
         Self
             This database, open for use.
+
+        Raises
+        ------
+        RuntimeError
+            If the database's `schema_version` isn't acceptable for how
+            it's being opened.
         """
         if self._con is None:
             self._con = ibis.duckdb.connect(self.path, read_only=self.read_only)
             if "db_meta" in self._con.list_tables():
                 found = self.db_meta.get("schema_version")
-                if found != schema.SCHEMA_VERSION:
+                acceptable = (
+                    found in schema.READ_COMPATIBLE_SCHEMA_VERSIONS
+                    if self.read_only
+                    else found == schema.SCHEMA_VERSION
+                )
+                if not acceptable:
                     self.close()
+                    mode = "read-only" if self.read_only else "read-write"
                     raise RuntimeError(
-                        f"database schema version {found!r} does not match "
-                        f"this imdb version's {schema.SCHEMA_VERSION!r}; "
+                        f"database schema version {found!r} is not usable {mode} "
+                        f"by this imdb version (schema {schema.SCHEMA_VERSION!r}); "
                         "the database needs rebuilding with a matching imdb version"
                     )
         return self
