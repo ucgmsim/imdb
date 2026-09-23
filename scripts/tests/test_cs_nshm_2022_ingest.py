@@ -1,8 +1,9 @@
 """Tests for scripts/cs_nshm_2022_ingest.py, on a synthetic two-campaign dataset.
 
 imdb's own CI installs neither h5py nor source-modelling, so this module skips
-there. Run it inside the imdb_tools image:
-    apptainer exec imdb_tools_<date>.sif python3 -m pytest -q scripts/tests
+there. To run it, add them from the repository root (fiona, which
+source-modelling needs, has no Python 3.14 wheel yet):
+    uv run --python 3.13 --group test --with h5py --with source-modelling pytest scripts/tests
 """
 
 import csv
