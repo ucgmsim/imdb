@@ -21,7 +21,7 @@ h5py = pytest.importorskip("h5py")
 pytest.importorskip("source_modelling")
 
 from imdb import IMDB  # noqa: E402
-from shapely import unary_union, wkt  # noqa: E402
+from shapely import force_2d, unary_union, wkt  # noqa: E402
 from source_modelling import moment, sources  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / "cs_nshm_2022_ingest.py"
@@ -489,6 +489,29 @@ def test_realisations_match_their_own_realisation_json(campaign: Campaign):
         assert metadata["duration_s"] == realisation["domain"]["duration"]
     # 161984_R2 starts on the other fault, so its causality tree is its own
     assert json.loads(realisations.loc["161984_R2", "metadata"])["rupture_causality_tree"]["Kekerengu"] is None
+
+
+def test_pilot_realisations_carry_their_own_fault_geometry(campaign: Campaign):
+    campaign.build()
+    with IMDB(campaign.out) as db:
+        realisations, events, meta = db.get_realisations(), db.get_events(), db.db_meta
+    for original_id, rel, pilot, _ in REALISATIONS:
+        metadata = json.loads(realisations.loc[rel, "metadata"])
+        if not pilot:
+            assert "fault_geometry_wkt" not in metadata
+            continue
+        stored = wkt.loads(metadata["fault_geometry_wkt"])
+        assert stored.geom_type == "MultiPolygon" and stored.has_z
+        # one polygon per plane, corners as (lon, lat, depth km), straight from realisation.json
+        geometries = campaign.realisation(original_id)["sources"]["source_geometries"].values()
+        corners = [c for g in geometries for c in g["corners"]]
+        expected = np.array([[c["longitude"], c["latitude"], c["depth"] / 1000] for c in corners]).reshape(-1, 4, 3)
+        got = np.array([np.array(polygon.exterior.coords)[:4] for polygon in stored.geoms])
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-12)
+    # In the shared event the pilot's planes are not the event's (the main campaign's)
+    pilot = wkt.loads(json.loads(realisations.loc["288271_R2", "metadata"])["fault_geometry_wkt"])
+    assert not wkt.loads(events.loc["288271", "source_wkt"]).equals(force_2d(pilot))
+    assert "realisations.metadata.fault_geometry_wkt" in meta["pilot_realisations"]
 
 
 def test_sites_use_canonical_coordinates(campaign: Campaign):

@@ -122,15 +122,18 @@ DB_META = {
         "rather than a random draw, so leave them out of between-realisation variability "
         "estimates. Their fault geometry comes from an earlier release of the NSHM fault "
         "database: the same trace and depths, with the bottom edge placed differently (by "
-        "a median of about 210 m, at most 2.6 km)."
+        "a median of about 210 m, at most 2.6 km). Each pilot realisation carries its own "
+        "fault planes in realisations.metadata.fault_geometry_wkt: a MULTIPOLYGON Z with "
+        "one polygon per plane, corners as (longitude, latitude, depth in km)."
     ),
     "distances": (
         "site_event rrup, rjb, rx and ry are computed from the event's own fault geometry, "
         "events.source_wkt (the main campaign's where the event has a main-campaign "
         "realisation, else the pilot's), and have NULL metadata. One exception: in an "
         "event that also has main-campaign realisations, at a site only its pilot "
-        "realisation covers, the distances come from the pilot's own geometry, which is "
-        f"not events.source_wkt, and site_event.metadata is {PILOT_DISTANCES}. Epicentral "
+        "realisation covers, the distances come from the pilot's own geometry "
+        "(realisations.metadata.fault_geometry_wkt), which is not events.source_wkt, and "
+        f"site_event.metadata is {PILOT_DISTANCES}. Epicentral "
         "and hypocentral distances are not stored; derive them from realisations.hypo_* "
         "and the site coordinates."
     ),
@@ -642,6 +645,20 @@ def trace_wkt(geometries: dict[str, Fault]) -> str:
     return MultiLineString([LineString(p.corners[:2, [1, 0]]) for p in planes]).wkt
 
 
+def fault_geometry_wkt(realisation: dict) -> str:
+    """The realisation's own fault planes, straight from realisation.json.
+
+    A MULTIPOLYGON Z with one polygon per plane, corners as (lon, lat, depth
+    in km). Unlike events.source_wkt it carries depth, so distances can be
+    recomputed from it alone.
+    """
+    planes = []
+    for entry in realisation["sources"]["source_geometries"].values():
+        corners = [[c["longitude"], c["latitude"], c["depth"] / 1000] for c in entry["corners"]]
+        planes.extend(Polygon(plane) for plane in np.array(corners).reshape(-1, 4, 3))
+    return MultiPolygon(planes).wkt
+
+
 def domain_polygon(realisation: dict) -> Polygon:
     corners = realisation["domain"]["domain"]
     return Polygon([(c["longitude"], c["latitude"]) for c in corners])
@@ -729,6 +746,17 @@ def build_realisation(row: ManifestRow, realisation: dict) -> dict:
     hypo_lat, hypo_lon, hypo_depth_m = geometries[initial_fault].fault_coordinates_to_wgs_depth_coordinates(
         np.array([hypocentre_sd["s"], hypocentre_sd["d"]])
     )
+    metadata = {
+        "pilot": row.pilot,
+        "seeds": realisation["seeds"],
+        "segment_magnitudes_boldm": realisation["magnitudes"]["magnitudes"],
+        "rupture_causality_tree": causality_tree,
+        "duration_s": realisation["domain"]["duration"],
+    }
+    if row.pilot:
+        # The pilot's geometry comes from an earlier NSHM database release, so
+        # it is not the event's wherever the main campaign also simulated it.
+        metadata["fault_geometry_wkt"] = fault_geometry_wkt(realisation)
     return {
         "rel_id": row.rel_id,
         "event_id": row.event_id,
@@ -737,15 +765,7 @@ def build_realisation(row: ManifestRow, realisation: dict) -> dict:
         "hypo_lat": float(hypo_lat),
         "hypo_lon": float(hypo_lon),
         "hypo_depth": float(hypo_depth_m) / 1000,
-        "metadata": json.dumps(
-            {
-                "pilot": row.pilot,
-                "seeds": realisation["seeds"],
-                "segment_magnitudes_boldm": realisation["magnitudes"]["magnitudes"],
-                "rupture_causality_tree": causality_tree,
-                "duration_s": realisation["domain"]["duration"],
-            }
-        ),
+        "metadata": json.dumps(metadata),
     }
 
 
