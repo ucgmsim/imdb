@@ -207,7 +207,7 @@ class Campaign:
     def realisation(self, original_id: str) -> dict:
         return json.loads(self.realisation_json(original_id).read_text())
 
-    def build(self, content=None) -> dict[str, int]:
+    def build(self, content=None, **kwargs) -> dict[str, int]:
         return ingest.build_database(
             self.manifest,
             self.stations_input,
@@ -216,6 +216,7 @@ class Campaign:
             harvested_at="2026-09-23T07:35:00Z",
             script_commit="abc123",
             content=content or ingest.Content(),
+            **kwargs,
         )
 
 
@@ -353,19 +354,34 @@ def _set(rows: list[dict[str, str]], rel: str, **changes: str) -> list[dict[str,
     "edit, match",
     [
         (lambda rows: _set(rows, "161984_R2", rel_id="161984_R3", realisation="3"), r"realisations \[1, 3\]"),
-        (lambda rows: _set(_set(rows, "288271_R1", pilot="true"), "288271_R2", pilot="false"), "the pilot is R1"),
-        (lambda rows: _set(rows, "288271_R1", pilot="true"), "2 pilot realisations"),
+        (lambda rows: _set(_set(rows, "288271_R1", pilot="true", campaign="run2"), "288271_R2", pilot="false", campaign="run3"),
+         "the pilot is R1"),
+        (lambda rows: _set(rows, "288271_R1", pilot="true", campaign="run2"), "2 pilot realisations"),
         (lambda rows: [*rows, rows[0]], "3_R1: listed twice"),
         (lambda rows: _set(rows, "3_R1", rel_id="3_R9"), "3_R9: expected 3_R1"),
         (lambda rows: _set(rows, "3_R1", event_id="03", rel_id="03_R1"), "not an unpadded integer"),
         (lambda rows: _set(rows, "3_R1", pilot="yes"), "pilot must be true or false"),
         (lambda rows: [{k: v for k, v in row.items() if k != "original_id"} for row in rows], "missing columns"),
+        (lambda rows: _set(rows, "3_R1", pilot="false"), r"campaign \['run2'\] has both pilot and non-pilot rows"),
     ],
-    ids=["gap", "pilot-not-last", "two-pilots", "duplicate", "rel-id-mismatch", "padded-event", "bad-pilot", "no-column"],
+    ids=["gap", "pilot-not-last", "two-pilots", "duplicate", "rel-id-mismatch", "padded-event", "bad-pilot", "no-column",
+         "pilot-flag-vs-campaign"],
 )  # fmt: skip
 def test_bad_manifests_are_refused(campaign: Campaign, edit, match):
     _write_manifest(campaign.manifest, edit(_manifest_rows(campaign)))
     with pytest.raises(ValueError, match=match):
+        ingest.read_manifest(campaign.manifest)
+
+
+def test_an_empty_manifest_is_refused(campaign: Campaign):
+    campaign.manifest.write_text(campaign.manifest.read_text().splitlines()[0] + "\n")
+    with pytest.raises(ValueError, match="lists no realisations"):
+        ingest.read_manifest(campaign.manifest)
+
+
+def test_missing_files_are_found_before_the_build_starts(campaign: Campaign):
+    campaign.realisation_json("161984/R3").unlink()
+    with pytest.raises(FileNotFoundError, match=r"161984_R2 \(161984/R3\)"):
         ingest.read_manifest(campaign.manifest)
 
 
@@ -403,7 +419,8 @@ def test_row_counts_and_meta(campaign: Campaign):
     assert meta["magnitude_convention"].startswith("BoldM")
     for key in ("description", "realisation_numbering", "pilot_realisations", "distances", "nshm_fault_database"):
         assert meta[key]
-    assert "source" not in meta and "nshmdb" not in meta
+    assert "nshmdb" not in meta
+    assert meta["source"] == "cs_nshm_2022 physics-based simulations; see description."
     for key, value in meta.items():  # nothing researcher-facing names our internals
         for word in ("run2", "run3", "/gpfs", "BSC", "envelope"):
             assert word not in value, f"db_meta {key} mentions {word}"
@@ -422,6 +439,7 @@ def test_events(campaign: Campaign):
     assert metadata["161984"]["nshmdb_rupture_id"] == 201460
     assert metadata["161984"]["annual_rate"] == 1.86e-04
     assert set(metadata["161984"]["segments"]) == {"Clarence", "Kekerengu"}
+    assert "nshm_rupture_name" not in metadata["161984"]  # it only ever held "Rupture <id>"
     assert {e: m["fault_geometry_release"] for e, m in metadata.items()} == {
         "3": "pre-v2026.08",
         "161984": "v2026.08.3",
@@ -609,6 +627,53 @@ def test_bad_input_stops_the_build(campaign: Campaign, corrupt, error, match):
     assert not campaign.out.exists()
 
 
+def test_files_of_another_event_stop_the_build(campaign: Campaign):
+    rows = _manifest_rows(campaign)
+    three = next(row for row in rows if row["rel_id"] == "3_R1")
+    other = next(row for row in rows if row["rel_id"] == "288271_R2")
+    for key in ("im_path", "realisation_path"):
+        three[key], other[key] = other[key], three[key]
+    _write_manifest(campaign.manifest, rows)
+    with pytest.raises(ValueError, match=r"3_R1 \(3\): realisation.json describes 'Rupture 288271', not event 3"):
+        campaign.build()
+
+
+def test_main_realisations_must_share_their_stations(campaign: Campaign):
+    _write_h5(campaign.h5("161984/R3"), STATIONS["161984/R3"][:3], campaign.realisation("161984/R3"), np.zeros((3, 4)), 9)
+    with pytest.raises(ValueError, match=r"161984_R2 \(161984/R3\): station list differs from 161984_R1"):
+        campaign.build()
+
+
+def test_expected_flag_count(campaign: Campaign):
+    with pytest.raises(RuntimeError, match="2 site_event rows carry the pilot's distances, expected 3"):
+        campaign.build(expect_flagged=3)
+    campaign.out.with_name("out.duckdb.partial").unlink()
+    assert campaign.build(expect_flagged=2)["site_event"] == 11
+
+
+def test_the_table_checks_catch_a_tampered_database(campaign: Campaign):
+    campaign.build()
+    with IMDB(campaign.out, read_only=False) as db:
+        ingest.check_site_event_matches_records(db)
+        ingest.check_flags(db, 2)
+        with pytest.raises(RuntimeError, match="2 flagged rows"):
+            ingest.check_flags(db, 5)
+        db.con.raw_sql("DELETE FROM site_event WHERE metadata IS NOT NULL")
+        with pytest.raises(RuntimeError, match="0 rows with no records, 2 record pairs with no row"):
+            ingest.check_site_event_matches_records(db)
+
+
+def test_release_memtables(tmp_path: Path):
+    db = IMDB.create(tmp_path / "m.duckdb", periods=[0.1], components=("geom",))
+    db.add_events(pd.DataFrame({"event_id": ["1"]}))
+    memtables = "SELECT count(*) FROM duckdb_views() WHERE temporary AND view_name LIKE 'ibis_pandas_memtable_%'"
+    assert db.con.raw_sql(memtables).fetchone()[0] > 0
+    ingest.release_memtables(db)
+    assert db.con.raw_sql(memtables).fetchone()[0] == 0
+    db.add_realisations(pd.DataFrame({"rel_id": ["1_R1"], "event_id": ["1"]}))  # still writable
+    db.close()
+
+
 def test_the_pilots_distances_are_not_compared_with_the_main_campaigns(campaign: Campaign):
     main, pilot = _h5_distances(campaign.h5("288271/R2")), _h5_distances(campaign.h5("288271"))
     assert not np.allclose(main.loc["2TfEMSL"], pilot.loc["2TfEMSL"])
@@ -666,6 +731,7 @@ def test_default_content():
         ({"components": ("geom", "rotd90")}, "unknown components"),
         ({"components": ("geom", "geom")}, "listed twice"),
         ({"components": ()}, "no components"),
+        ({"components": ("rotd50",), "fas": True}, "--fas needs a component that has FAS"),
     ],
 )
 def test_bad_content_is_refused(kwargs, match):
@@ -722,3 +788,15 @@ def test_a_different_period_grid_stops_an_all_periods_build(campaign: Campaign):
         h5["pSA/period"][0] = 0.015
     with pytest.raises(ValueError, match="0.01 s matches 0"):
         campaign.build(ingest.Content(all_periods=True))
+
+
+def test_eas_alone(campaign: Campaign):
+    n_stations = sum(len(stations) for stations in STATIONS.values())
+    counts = campaign.build(ingest.Content(components=("eas",), fas=True))
+    assert (counts["records"], counts["psa_ims"], counts["scalars_ims"], counts["fas_ims"]) == (n_stations, 0, 0, n_stations)
+    with IMDB(campaign.out) as db:
+        meta = db.db_meta
+        assert db.validate() == []
+    assert meta["n_periods"] == "0"
+    assert meta["psa_period_selection"] == "not included"
+    assert meta["fas"].startswith("all 3 of im-calc's FAS frequencies, 0.1-10 Hz, for eas")

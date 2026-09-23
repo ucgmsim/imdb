@@ -86,7 +86,9 @@ DISTANCE_FIELDS = ("rrup", "rjb", "rx", "ry")
 # over all 221 realisations done on 2026-09-21: magnitude identical, hypocentre
 # within 3e-14 degrees.
 TOLERANCES = {"magnitude": 1e-9, "hypo_lat": 1e-9, "hypo_lon": 1e-9, "hypo_depth": 1e-6}
-MANIFEST_FIELDS = ("rel_id", "event_id", "realisation", "pilot", "original_id", "im_path", "realisation_path")
+MANIFEST_FIELDS = (
+    "rel_id", "event_id", "realisation", "pilot", "campaign", "original_id", "im_path", "realisation_path",
+)  # fmt: skip
 # site_event.metadata on a row whose distances come from the pilot's geometry
 # although the event's geometry is the main campaign's.
 PILOT_DISTANCES = json.dumps({"fault_geometry": "pilot"})
@@ -102,11 +104,13 @@ DB_META = {
     "description": (
         "Physics-based ground-motion simulations of New Zealand NSHM 2022 crustal "
         "ruptures. Each event is one rupture and each realisation is one simulation of "
-        "it, with its own randomly drawn magnitude, hypocentre, rupture propagation and "
-        "slip. Most realisations come from the main campaign, up to two per rupture; "
-        "those from an earlier pilot campaign are marked realisations.metadata.pilot = "
-        "true."
+        "it, with its own hypocentre, rupture propagation and slip. Most realisations "
+        "come from the main campaign, up to two per rupture, which also draws each "
+        "realisation's magnitude at random. The rest come from an earlier pilot "
+        "campaign, are marked realisations.metadata.pilot = true, and use the scaling "
+        "relation's central magnitude instead."
     ),
+    "source": "cs_nshm_2022 physics-based simulations; see description.",
     "realisation_numbering": (
         "Each event's realisations are R1..Rn with no gaps. Where an event has a pilot "
         "realisation, it is always the last. The seeds in realisations.metadata identify "
@@ -118,15 +122,17 @@ DB_META = {
         "rather than a random draw, so leave them out of between-realisation variability "
         "estimates. Their fault geometry comes from an earlier release of the NSHM fault "
         "database: the same trace and depths, with the bottom edge placed differently (by "
-        "a median of 226 m, at most 1.8 km)."
+        "a median of about 210 m, at most 2.6 km)."
     ),
     "distances": (
-        "site_event rrup, rjb, rx and ry are computed from the event's own fault geometry "
-        "(events.source_wkt): the main campaign's where the event has a main-campaign "
-        "realisation, else the pilot's. At a site that only the pilot's realisation "
-        f"covers, they come from the pilot's geometry and site_event.metadata is "
-        f"{PILOT_DISTANCES}. Epicentral and hypocentral distances are not stored; derive "
-        "them from realisations.hypo_* and the site coordinates."
+        "site_event rrup, rjb, rx and ry are computed from the event's own fault geometry, "
+        "events.source_wkt (the main campaign's where the event has a main-campaign "
+        "realisation, else the pilot's), and have NULL metadata. One exception: in an "
+        "event that also has main-campaign realisations, at a site only its pilot "
+        "realisation covers, the distances come from the pilot's own geometry, which is "
+        f"not events.source_wkt, and site_event.metadata is {PILOT_DISTANCES}. Epicentral "
+        "and hypocentral distances are not stored; derive them from realisations.hypo_* "
+        "and the site coordinates."
     ),
     "nshm_fault_database": (
         "events.metadata.fault_geometry_release names the NSHM2022DB release the event's "
@@ -141,9 +147,10 @@ DB_META = {
         "moment-summed total."
     ),
     "station_coordinates": (
-        "sites.lat/lon are the canonical stations_input.ll coordinates. The "
-        "simulation snapped each station to its rupture's grid (~0.1 km away, so "
-        "up to ~0.25 km apart between ruptures); those coordinates are not stored."
+        "sites.lat/lon are each station's canonical location. Each simulation moved "
+        "its stations onto its own computational grid (~0.1 km away, so up to ~0.25 km "
+        "apart between simulations) and computed the distances there; those "
+        "coordinates are not stored."
     ),
 }
 
@@ -190,6 +197,8 @@ class Content:
             raise ValueError(f"unknown components {sorted(unknown)}; choose from {schema.COMPONENTS}")
         if "eas" in self.components and not self.fas:
             raise ValueError("eas has only FAS, so it needs --fas")
+        if self.fas and not self.fas_components:
+            raise ValueError(f"--fas needs a component that has FAS: one of {', '.join(FAS_COMPONENTS)}")
 
     @property
     def psa_components(self) -> tuple[str, ...]:
@@ -217,14 +226,21 @@ DEFAULT_GRIDS = Grids(periods=PSA_PERIODS, frequencies=())
 def read_grids(h5_path: Path, content: Content) -> Grids:
     """The database's grids, taken from one realisation's h5 where the content needs its full grid."""
     with h5py.File(h5_path, "r") as h5:
-        periods = tuple(float(p) for p in h5["pSA"]["period"][:]) if content.all_periods else PSA_PERIODS
+        if not content.psa_components:
+            periods: tuple[float, ...] = ()
+        elif content.all_periods:
+            periods = tuple(float(p) for p in h5["pSA"]["period"][:])
+        else:
+            periods = PSA_PERIODS
         frequencies = tuple(float(f) for f in h5["FAS"]["frequency"][:]) if content.fas else ()
     return Grids(periods=periods, frequencies=frequencies)
 
 
 def content_meta(content: Content, grids: Grids) -> dict[str, str]:
     """db_meta entries describing what the options put in."""
-    if content.all_periods:
+    if not content.psa_components:
+        periods = "not included"
+    elif content.all_periods:
         periods = f"all {len(grids.periods)} of im-calc's periods, {min(grids.periods):g}-{max(grids.periods):g} s."
     else:
         periods = (
@@ -255,6 +271,8 @@ class ManifestRow:
     event_id: str
     realisation: int
     pilot: bool
+    campaign: str
+    """Which simulation campaign; for checks only, never stored."""
     original_id: str
     """Where the result came from; for messages only, never stored."""
     im_path: Path
@@ -282,17 +300,35 @@ def read_manifest(path: Path) -> list[ManifestRow]:
                     event_id=raw["event_id"],
                     realisation=int(raw["realisation"]),
                     pilot=raw["pilot"] == "true",
+                    campaign=raw["campaign"],
                     original_id=raw["original_id"],
                     im_path=Path(raw["im_path"]),
                     realisation_path=Path(raw["realisation_path"]),
                 )
             )
     check_manifest(rows)
+    missing = [
+        f"{row.label}: {path}" for row in rows for path in (row.im_path, row.realisation_path) if not path.is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(f"{len(missing)} listed files are missing, e.g. " + "; ".join(missing[:5]))
     return sorted(rows, key=lambda row: (int(row.event_id), row.realisation))
 
 
 def check_manifest(rows: Sequence[ManifestRow]) -> None:
-    """Raise unless ids are consistent and unique, and every event is R1..Rn with at most one pilot, last."""
+    """Raise unless ids are consistent and unique, and every event is R1..Rn with at most one pilot, last.
+
+    The pilot flag must also follow the campaign: no campaign may supply both
+    pilot and non-pilot rows.
+    """
+    if not rows:
+        raise ValueError("the manifest lists no realisations")
+    pilot_campaigns = {row.campaign for row in rows if row.pilot}
+    main_campaigns = {row.campaign for row in rows if not row.pilot}
+    if pilot_campaigns & main_campaigns:
+        raise ValueError(
+            f"campaign {sorted(pilot_campaigns & main_campaigns)} has both pilot and non-pilot rows"
+        )
     seen: set[str] = set()
     by_event: dict[str, list[ManifestRow]] = {}
     for row in rows:
@@ -673,7 +709,6 @@ def build_event(
         "domain_wkt": domain_wkt(realisations),
         "metadata": json.dumps(
             {
-                "nshm_rupture_name": defining["metadata"]["name"],
                 "nshmdb_rupture_id": int(nshm["nshmdb_rupture_id"]),
                 "annual_rate": float(nshm["annual_rate"]),
                 "nshm_area_km2": float(nshm["area_km2"]),
@@ -728,6 +763,21 @@ def check_against_h5(rel: str, realisation_row: dict, attrs: dict[str, float]) -
 # ---- build and verify ----------------------------------------------------------
 
 
+def load_realisation(row: ManifestRow, content: Content, grids: Grids) -> tuple[dict, RealisationIMs]:
+    """Read one realisation's realisation.json and h5, naming the realisation in any error.
+
+    Raises unless the realisation.json describes the manifest row's event.
+    """
+    try:
+        realisation = json.loads(row.realisation_path.read_text())
+        name = realisation["metadata"]["name"]
+        if name != f"Rupture {row.event_id}":
+            raise ValueError(f"realisation.json describes {name!r}, not event {row.event_id}")
+        return realisation, read_ims(row.im_path, content, grids)
+    except (KeyError, OSError, ValueError) as error:
+        raise type(error)(f"{row.label}: {error}") from error
+
+
 @dataclass
 class Loaded:
     """One realisation read from disk."""
@@ -735,6 +785,20 @@ class Loaded:
     row: ManifestRow
     realisation: dict
     ims: RealisationIMs
+
+
+def release_memtables(db: IMDB) -> None:
+    """Drop the in-memory tables ibis registers for every insert.
+
+    ibis (12.0) registers each inserted DataFrame with DuckDB as an Arrow table
+    and releases them only at interpreter exit, so without this every row
+    written stays in memory, outside DuckDB's memory_limit, for the whole build.
+    """
+    raw = db.con.con
+    for (name,) in raw.execute(
+        "SELECT view_name FROM duckdb_views() WHERE temporary AND view_name LIKE 'ibis_pandas_memtable_%'"
+    ).fetchall():
+        raw.unregister(name)
 
 
 def check_row_counts(db: IMDB, expected: dict[str, int]) -> None:
@@ -769,6 +833,23 @@ SELECT
      WHERE site_event.metadata IS NOT NULL
        AND site_event.event_int_id IN (SELECT event_int_id FROM shared))
 """
+
+
+# site_event must hold exactly the (site, event) pairs that have records: the
+# pairs in site_event but not in records, and those in records but not in site_event.
+SITE_EVENT_QUERY = """
+WITH pairs AS (SELECT DISTINCT site_int_id, event_int_id FROM records)
+SELECT
+    (SELECT count(*) FROM site_event ANTI JOIN pairs USING (site_int_id, event_int_id)),
+    (SELECT count(*) FROM pairs ANTI JOIN site_event USING (site_int_id, event_int_id))
+"""
+
+
+def check_site_event_matches_records(db: IMDB) -> None:
+    """Raise unless site_event has a row for exactly the (site, event) pairs that have records."""
+    extra, missing = db.con.raw_sql(SITE_EVENT_QUERY).fetchone()
+    if extra or missing:
+        raise RuntimeError(f"site_event: {extra} rows with no records, {missing} record pairs with no row")
 
 
 def check_flags(db: IMDB, n_flagged: int) -> None:
@@ -866,6 +947,7 @@ def build_database(
     script_commit: str,
     content: Content = DEFAULT_CONTENT,
     memory_limit: str | None = None,
+    expect_flagged: int | None = None,
 ) -> dict[str, int]:
     """Build the database at out_path and return its table row counts.
 
@@ -918,15 +1000,11 @@ def build_database(
         for index, (event_id, group) in enumerate(by_event.items(), start=1):
             loaded = []
             for row in group:
-                for path in (row.im_path, row.realisation_path):
-                    if not path.exists():
-                        raise FileNotFoundError(f"{row.label}: no {path}")
-                realisation = json.loads(row.realisation_path.read_text())
+                realisation, ims = load_realisation(row, content, grids)
                 seeds = json.dumps(realisation["seeds"], sort_keys=True)
                 if seeds in seeds_seen:
                     raise ValueError(f"{row.label}: the same seeds as {seeds_seen[seeds]}")
                 seeds_seen[seeds] = row.rel_id
-                ims = read_ims(row.im_path, content, grids)
                 check_finite(row.label, ims)
                 loaded.append(Loaded(row, realisation, ims))
                 peaks.append((row, ims.peaks))
@@ -968,6 +1046,7 @@ def build_database(
                 counts["scalars_ims"] += n * len(content.psa_components)
                 counts["fas_ims"] += n * len(content.fas_components)
 
+            release_memtables(db)
             counts["events"] += 1
             counts["realisations"] += len(loaded)
             counts["sites"] += len(new_sites)
@@ -984,7 +1063,10 @@ def build_database(
         if problems:
             raise RuntimeError(f"validate(): {problems}")
         check_row_counts(db, counts)
+        check_site_event_matches_records(db)
         check_flags(db, n_flagged)
+        if expect_flagged is not None and n_flagged != expect_flagged:
+            raise RuntimeError(f"{n_flagged} site_event rows carry the pilot's distances, expected {expect_flagged}")
     finally:
         db.close()
 
@@ -1022,6 +1104,11 @@ def main() -> None:
     )
     parser.add_argument("--fas", action="store_true", help="add FAS on im-calc's full frequency grid")
     parser.add_argument(
+        "--expect-flagged",
+        type=int,
+        help="fail unless exactly this many site_event rows carry the pilot's distances",
+    )
+    parser.add_argument(
         "--memory-limit",
         help="DuckDB memory_limit, e.g. 12GB. Without it DuckDB sizes itself from "
         "the node's RAM, not the job's memory allocation.",
@@ -1043,6 +1130,7 @@ def main() -> None:
         script_commit=args.script_commit,
         content=content,
         memory_limit=args.memory_limit,
+        expect_flagged=args.expect_flagged,
     )
     print("row counts:", counts)
 
