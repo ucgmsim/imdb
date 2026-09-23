@@ -14,12 +14,22 @@
 # python-preference = "only-managed"  # avoid a broken/non-standard system Python on PATH
 # ///
 
-"""Ingest the cs_nshm_2022 run3 simulation campaign into an IMDB.
+"""Ingest the cs_nshm_2022 simulations into one IMDB.
 
-One event per NSHM 2022 crustal rupture and one realisation per simulated
-`R<n>`. The event_id is the campaign's rupture id, which is the rupture's
-crustal `nshm_id` in nshmdb, NOT its `rupture_id`; the rel_id is
-`<rupture>_R<n>`.
+Two simulation campaigns become one dataset. Each event is one NSHM 2022
+crustal rupture and each realisation is one simulation of it:
+
+- the main campaign: up to two realisations per rupture, each with its own
+  randomly drawn magnitude, hypocentre, rupture propagation and slip;
+- the pilot: one realisation for each of 293 ruptures. Its magnitude is the
+  scaling relation's central value, and its fault geometry comes from an
+  earlier NSHM fault database release.
+
+A manifest CSV (cs_nshm_2022's scripts/build_imdb_manifest.py) lists every
+realisation with its rel_id, pilot flag and file paths, so this script knows
+nothing about either campaign's layout. Each event's realisations are R1..Rn
+with no gaps and the pilot's last. The event_id is the rupture's crustal
+`nshm_id` in nshmdb, NOT its `rupture_id`.
 
 - IMs, distances, vs30 and z1.0/z2.5 come from each realisation's
   `intensity_measures.h5`, as written by the workflow's im-calc: netCDF4, one
@@ -29,6 +39,10 @@ crustal `nshm_id` in nshmdb, NOT its `rupture_id`; the rel_id is
   nshmdb, which is not available where this runs.
 - Canonical site coordinates come from the campaign's `stations_input.ll`.
 
+An event's geometry, and the distances stored for it, come from its first main
+realisation, or from the pilot where the main campaign has none. At a site only
+the pilot covers, site_event holds the pilot's distances, flagged in its metadata.
+
 Trimmed for size: only the geom and rotd50 components, pSA on 25 of im-calc's
 111 periods, and no FAS or empirical-GMM records.
 
@@ -37,10 +51,11 @@ nz_sim_validation_ingest.py converts to Mw instead.
 """
 
 import argparse
+import csv
+import hashlib
 import json
-import re
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -48,6 +63,7 @@ import h5py
 import numpy as np
 import pandas as pd
 from imdb import IMDB, schema
+from shapely import unary_union
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
 from source_modelling import moment
 from source_modelling.sources import Fault
@@ -66,9 +82,55 @@ DISTANCE_FIELDS = ("rrup", "rjb", "rx", "ry")
 # over all 221 realisations done on 2026-09-21: magnitude identical, hypocentre
 # within 3e-14 degrees.
 TOLERANCES = {"magnitude": 1e-9, "hypo_lat": 1e-9, "hypo_lon": 1e-9, "hypo_depth": 1e-6}
+MANIFEST_FIELDS = ("rel_id", "event_id", "realisation", "pilot", "original_id", "im_path", "realisation_path")
+# site_event.metadata on a row whose distances come from the pilot's geometry
+# although the event's geometry is the main campaign's.
+PILOT_DISTANCES = json.dumps({"fault_geometry": "pilot"})
+# The NSHM fault database releases behind each campaign's geometry.
+MAIN_RELEASE = "v2026.08.3"
+MAIN_NSHMDB_SHA256 = "3fe692cb9b22c769b6a9baa6a526b4eed989bd61ec054a344f0e74d82855bc4e"
+PILOT_RELEASE = "pre-v2026.08"
+PILOT_NSHMDB_SHA256 = "00e256480618cd15e11fbf744037d037bf3fc2d523fb977ee30e0b84a640bc57"
+N_TOP_PEAKS = 20
 
 DB_META = {
-    "dataset_id": "cs_nshm_2022_run3",
+    "dataset_id": "cs_nshm_2022",
+    "description": (
+        "Physics-based ground-motion simulations of New Zealand NSHM 2022 crustal "
+        "ruptures. Each event is one rupture and each realisation is one simulation of "
+        "it, with its own randomly drawn magnitude, hypocentre, rupture propagation and "
+        "slip. Most realisations come from the main campaign, up to two per rupture; "
+        "those from an earlier pilot campaign are marked realisations.metadata.pilot = "
+        "true."
+    ),
+    "realisation_numbering": (
+        "Each event's realisations are R1..Rn with no gaps. Where an event has a pilot "
+        "realisation, it is always the last. The seeds in realisations.metadata identify "
+        "each simulation uniquely."
+    ),
+    "pilot_realisations": (
+        "realisations.metadata.pilot = true marks the pilot's realisations, at most one "
+        "per event. Their magnitude is the magnitude-area scaling relation's central value "
+        "rather than a random draw, so leave them out of between-realisation variability "
+        "estimates. Their fault geometry comes from an earlier release of the NSHM fault "
+        "database: the same trace and depths, with the bottom edge placed differently (by "
+        "a median of 226 m, at most 1.8 km)."
+    ),
+    "distances": (
+        "site_event rrup, rjb, rx and ry are computed from the event's own fault geometry "
+        "(events.source_wkt): the main campaign's where the event has a main-campaign "
+        "realisation, else the pilot's. At a site that only the pilot's realisation "
+        f"covers, they come from the pilot's geometry and site_event.metadata is "
+        f"{PILOT_DISTANCES}. Epicentral and hypocentral distances are not stored; derive "
+        "them from realisations.hypo_* and the site coordinates."
+    ),
+    "nshm_fault_database": (
+        "events.metadata.fault_geometry_release names the NSHM2022DB release the event's "
+        f"geometry comes from: {MAIN_RELEASE} (sha256 {MAIN_NSHMDB_SHA256}), or "
+        f"{PILOT_RELEASE}, the earlier release the pilot used (sha256 "
+        f"{PILOT_NSHMDB_SHA256}). events.magnitude and the NSHM attributes in "
+        f"events.metadata come from {MAIN_RELEASE} for every event."
+    ),
     "magnitude_convention": (
         "BoldM (Hanks & Kanamori 1979 eq. 7). events.magnitude is the NSHM 2022 "
         "catalogue magnitude; realisations.magnitude is the realisation's own "
@@ -108,35 +170,90 @@ def select_period_indices(
     return np.array(indices)
 
 
-def parse_realisation_ids(lines: Iterable[str]) -> list[tuple[str, int]]:
-    """Parse `<rupture>/R<n>` lines into (rupture, n) pairs, in ingest order.
-
-    Blank lines are skipped and duplicates dropped; the order is by integer
-    rupture id, then realisation.
-    """
-    ids = set()
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        match = re.fullmatch(r"(\d+)/R(\d+)", line)
-        if match is None:
-            raise ValueError(f"not a <rupture>/R<n> id: {line!r}")
-        ids.add((str(int(match[1])), int(match[2])))
-    return sorted(ids, key=lambda rel: (int(rel[0]), rel[1]))
+def rel_id(event_id: str, n: int) -> str:
+    """The realisation's stable id."""
+    return f"{event_id}_R{n}"
 
 
-def group_by_rupture(realisations: Sequence[tuple[str, int]]) -> dict[str, list[int]]:
-    """Realisation numbers per rupture, keeping the input order."""
-    grouped: dict[str, list[int]] = {}
-    for rupture, n in realisations:
-        grouped.setdefault(rupture, []).append(n)
+@dataclass(frozen=True)
+class ManifestRow:
+    """One realisation to ingest, as listed in the build manifest."""
+
+    rel_id: str
+    event_id: str
+    realisation: int
+    pilot: bool
+    original_id: str
+    """Where the result came from; for messages only, never stored."""
+    im_path: Path
+    realisation_path: Path
+
+    @property
+    def label(self) -> str:
+        return f"{self.rel_id} ({self.original_id})"
+
+
+def read_manifest(path: Path) -> list[ManifestRow]:
+    """The manifest's rows in ingest order: events by integer id, then realisations."""
+    with path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        missing = set(MANIFEST_FIELDS) - set(reader.fieldnames or ())
+        if missing:
+            raise ValueError(f"{path}: missing columns {sorted(missing)}")
+        rows = []
+        for raw in reader:
+            if raw["pilot"] not in ("true", "false"):
+                raise ValueError(f"{raw['rel_id']}: pilot must be true or false, not {raw['pilot']!r}")
+            rows.append(
+                ManifestRow(
+                    rel_id=raw["rel_id"],
+                    event_id=raw["event_id"],
+                    realisation=int(raw["realisation"]),
+                    pilot=raw["pilot"] == "true",
+                    original_id=raw["original_id"],
+                    im_path=Path(raw["im_path"]),
+                    realisation_path=Path(raw["realisation_path"]),
+                )
+            )
+    check_manifest(rows)
+    return sorted(rows, key=lambda row: (int(row.event_id), row.realisation))
+
+
+def check_manifest(rows: Sequence[ManifestRow]) -> None:
+    """Raise unless ids are consistent and unique, and every event is R1..Rn with at most one pilot, last."""
+    seen: set[str] = set()
+    by_event: dict[str, list[ManifestRow]] = {}
+    for row in rows:
+        if not row.event_id.isdigit() or str(int(row.event_id)) != row.event_id:
+            raise ValueError(f"{row.rel_id}: event_id {row.event_id!r} is not an unpadded integer")
+        if row.rel_id != rel_id(row.event_id, row.realisation):
+            raise ValueError(f"{row.rel_id}: expected {rel_id(row.event_id, row.realisation)} from event_id and realisation")
+        if row.rel_id in seen:
+            raise ValueError(f"{row.rel_id}: listed twice")
+        seen.add(row.rel_id)
+        by_event.setdefault(row.event_id, []).append(row)
+    for event_id, group in by_event.items():
+        numbers = sorted(row.realisation for row in group)
+        if numbers != list(range(1, len(group) + 1)):
+            raise ValueError(f"event {event_id}: realisations {numbers}, expected 1..{len(group)}")
+        pilots = [row for row in group if row.pilot]
+        if len(pilots) > 1:
+            raise ValueError(f"event {event_id}: {len(pilots)} pilot realisations, expected at most 1")
+        if pilots and pilots[0].realisation != len(group):
+            raise ValueError(f"event {event_id}: the pilot is R{pilots[0].realisation}, but it must be the last, R{len(group)}")
+
+
+def group_by_event(rows: Sequence[ManifestRow]) -> dict[str, list[ManifestRow]]:
+    """Rows per event, keeping the input order."""
+    grouped: dict[str, list[ManifestRow]] = {}
+    for row in rows:
+        grouped.setdefault(row.event_id, []).append(row)
     return grouped
 
 
-def rel_id(rupture: str, n: int) -> str:
-    """The realisation's stable id."""
-    return f"{rupture}_R{n}"
+def md5_of(path: Path) -> str:
+    """Hex md5 of a file."""
+    return hashlib.md5(path.read_bytes()).hexdigest()
 
 
 def load_stations_input(path: Path) -> pd.DataFrame:
@@ -151,8 +268,17 @@ def load_stations_input(path: Path) -> pd.DataFrame:
 
 
 def load_nshm_attributes(path: Path) -> pd.DataFrame:
-    """Rows of export_nshm_rupture_attributes.py's CSV, indexed by rupture id."""
-    return pd.read_csv(path, dtype={"rupture_id": str}).set_index("rupture_id")
+    """Rows of export_nshm_rupture_attributes.py's CSV, indexed by rupture id.
+
+    Raises unless they all come from the release DB_META documents.
+    """
+    nshm = pd.read_csv(path, dtype={"rupture_id": str}).set_index("rupture_id")
+    if set(nshm["nshmdb_sha256"]) != {MAIN_NSHMDB_SHA256}:
+        raise ValueError(
+            f"{path}: NSHM attributes must all come from {MAIN_RELEASE} "
+            f"(sha256 {MAIN_NSHMDB_SHA256}), found {sorted(set(nshm['nshmdb_sha256']))}"
+        )
+    return nshm
 
 
 def is_real_station(site_id: str) -> bool:
@@ -179,10 +305,18 @@ class RealisationIMs:
     """Scalar IM -> component -> (n_stations,) float32; rotd-undefined IMs omitted."""
     attrs: dict[str, float]
     """The file's magnitude and hypocentre attributes (TOLERANCES keys)."""
+    peaks: dict[str, tuple[float, str]]
+    """PGA and PGV (geom) -> (largest value, its station), whatever the database keeps."""
 
 
 def _decode(values: np.ndarray) -> np.ndarray:
     return np.array([v.decode() if isinstance(v, bytes) else v for v in values], dtype=object)
+
+
+def _peak(values: np.ndarray, stations: np.ndarray) -> tuple[float, str]:
+    i = int(np.nanargmax(values))
+    station = stations[i]
+    return float(values[i]), station.decode() if isinstance(station, bytes) else str(station)
 
 
 def read_ims(h5_path: Path) -> RealisationIMs:
@@ -213,6 +347,7 @@ def read_ims(h5_path: Path) -> RealisationIMs:
             psa={c: psa_group[c][:][:, columns].astype(np.float32) for c in COMPONENTS},
             scalars=scalars,
             attrs={key: float(np.atleast_1d(h5.attrs[key])[0]) for key in TOLERANCES},
+            peaks={im: _peak(h5[im]["geom"][:], raw_stations) for im in ("PGA", "PGV")},
         )
 
 
@@ -236,7 +371,7 @@ def check_finite(rel: str, ims: RealisationIMs) -> None:
 def check_matches_first_realisation(
     rel: str, first_rel: str, ims: RealisationIMs, first: RealisationIMs
 ) -> None:
-    """Raise unless stations, site fields and distances equal the rupture's first realisation's."""
+    """Raise unless stations, site fields and distances equal the event's first main realisation's."""
     if not np.array_equal(ims.stations, first.stations):
         raise ValueError(f"{rel}: station list differs from {first_rel}")
     for mine, theirs in ((ims.site, first.site), (ims.distances, first.distances)):
@@ -244,7 +379,7 @@ def check_matches_first_realisation(
             if not np.array_equal(values, theirs[key]):
                 raise ValueError(
                     f"{rel}: {key} differs from {first_rel}; site and distance fields "
-                    "must be identical across a rupture's realisations"
+                    "must be identical across an event's main realisations"
                 )
 
 
@@ -261,9 +396,36 @@ def build_records(rel: str, ims: RealisationIMs) -> tuple[pd.DataFrame, np.ndarr
     return records, np.concatenate([ims.psa[c] for c in COMPONENTS])
 
 
-def build_site_event(rupture: str, ims: RealisationIMs) -> pd.DataFrame:
-    """site_event rows for one rupture."""
-    return pd.DataFrame({"site_id": ims.stations, "event_id": rupture, **ims.distances})
+def _site_event_rows(event_id: str, stations: np.ndarray, distances: dict[str, np.ndarray], metadata: str | None) -> pd.DataFrame:
+    return pd.DataFrame({"site_id": stations, "event_id": event_id, **distances, "metadata": metadata})
+
+
+def build_site_event(
+    event_id: str, main: RealisationIMs | None, pilot: RealisationIMs | None
+) -> tuple[pd.DataFrame, int]:
+    """site_event rows for one event, and how many carry the pilot's distances.
+
+    The main campaign's distances wherever its realisations cover the site: they
+    all share one station list and one set of distances, so the first covers
+    them all. The pilot's only where nothing else exists, flagged when the
+    event's geometry is the main campaign's and unflagged when the event is the
+    pilot's alone.
+    """
+    if main is None:
+        if pilot is None:
+            raise ValueError(f"event {event_id}: no realisations")
+        return _site_event_rows(event_id, pilot.stations, pilot.distances, None), 0
+    rows = _site_event_rows(event_id, main.stations, main.distances, None)
+    if pilot is None:
+        return rows, 0
+    gap = ~pd.Index(pilot.stations).isin(main.stations)
+    flagged = _site_event_rows(
+        event_id,
+        pilot.stations[gap],
+        {key: values[gap] for key, values in pilot.distances.items()},
+        PILOT_DISTANCES,
+    )
+    return pd.concat([rows, flagged], ignore_index=True), int(gap.sum())
 
 
 class SiteRegistry:
@@ -273,7 +435,7 @@ class SiteRegistry:
         self.stations_input = stations_input
         self.seen: pd.DataFrame | None = None
 
-    def new_sites(self, rupture: str, ims: RealisationIMs) -> pd.DataFrame:
+    def new_sites(self, label: str, ims: RealisationIMs) -> pd.DataFrame:
         """Rows for stations not added yet; raise if a known one disagrees."""
         here = pd.DataFrame(ims.site, index=pd.Index(ims.stations, name="site_id"))
         if self.seen is None:
@@ -286,14 +448,14 @@ class SiteRegistry:
                 if mismatch.any():
                     site = mismatch[mismatch].index[0]
                     raise ValueError(
-                        f"rupture {rupture}: {site} has {here.loc[site].to_dict()}, but an "
-                        f"earlier rupture gave {earlier.loc[site].to_dict()}"
+                        f"{label}: {site} has {here.loc[site].to_dict()}, but an "
+                        f"earlier realisation gave {earlier.loc[site].to_dict()}"
                     )
             new = here[~known]
         missing = new.index.difference(self.stations_input.index)
         if len(missing):
             raise ValueError(
-                f"rupture {rupture}: {len(missing)} stations missing from "
+                f"{label}: {len(missing)} stations missing from "
                 f"stations_input.ll, e.g. {list(missing[:5])}"
             )
         self.seen = new if self.seen is None else pd.concat([self.seen, new])
@@ -337,9 +499,14 @@ def trace_wkt(geometries: dict[str, Fault]) -> str:
     return MultiLineString([LineString(p.corners[:2, [1, 0]]) for p in planes]).wkt
 
 
-def domain_wkt(realisation: dict) -> str:
+def domain_polygon(realisation: dict) -> Polygon:
     corners = realisation["domain"]["domain"]
-    return Polygon([(c["longitude"], c["latitude"]) for c in corners]).wkt
+    return Polygon([(c["longitude"], c["latitude"]) for c in corners])
+
+
+def domain_wkt(realisations: Sequence[dict]) -> str:
+    """The union of the realisations' simulation domains, so it contains every site with data."""
+    return unary_union([domain_polygon(r) for r in realisations]).wkt
 
 
 def total_magnitude(realisation: dict) -> float:
@@ -349,15 +516,19 @@ def total_magnitude(realisation: dict) -> float:
     return float(moment.moment_to_magnitude(total_moment, bold_m=True))
 
 
-def build_event(event_id: str, realisation: dict, nshm: pd.Series) -> tuple[dict, dict[str, Fault]]:
-    """The events row for a rupture, from one of its realisations and its NSHM attributes.
+def build_event(
+    event_id: str, defining: dict, realisations: Sequence[dict], nshm: pd.Series, release: str
+) -> dict:
+    """The events row for a rupture.
 
-    Geometry is identical across a rupture's realisations, but magnitude and
-    causality tree are not, so those live on the realisation instead.
+    Geometry comes from `defining`, the realisation whose geometry the event's
+    unflagged distances share; the domain is the union over `realisations`.
+    Magnitude and causality tree differ between realisations, so those live on
+    the realisation instead.
     """
-    geometries = fault_geometries(realisation)
-    rakes = realisation["rakes"]["rakes"]
-    tect_type = realisation.get("empirical", {}).get("tect_type", "").upper()
+    geometries = fault_geometries(defining)
+    rakes = defining["rakes"]["rakes"]
+    tect_type = defining.get("empirical", {}).get("tect_type", "").upper()
     if tect_type not in schema.TECT_TYPES:
         raise ValueError(f"rupture {event_id}: tect_type {tect_type!r} is not one of {schema.TECT_TYPES}")
 
@@ -381,7 +552,7 @@ def build_event(event_id: str, realisation: dict, nshm: pd.Series) -> tuple[dict
         }
         for name, f in geometries.items()
     }
-    event = {
+    return {
         "event_id": event_id,
         "magnitude": float(nshm["magnitude_boldm"]),
         "tect_type": tect_type,
@@ -392,23 +563,24 @@ def build_event(event_id: str, realisation: dict, nshm: pd.Series) -> tuple[dict
         "length": length,
         "source_wkt": source_wkt(geometries),
         "trace_wkt": trace_wkt(geometries),
-        "domain_wkt": domain_wkt(realisation),
+        "domain_wkt": domain_wkt(realisations),
         "metadata": json.dumps(
             {
-                "nshm_rupture_name": realisation["metadata"]["name"],
+                "nshm_rupture_name": defining["metadata"]["name"],
                 "nshmdb_rupture_id": int(nshm["nshmdb_rupture_id"]),
                 "annual_rate": float(nshm["annual_rate"]),
                 "nshm_area_km2": float(nshm["area_km2"]),
                 "nshm_length_km": float(nshm["length_km"]),
+                "fault_geometry_release": release,
                 "segments": segments,
             }
         ),
     }
-    return event, geometries
 
 
-def build_realisation(rupture: str, n: int, geometries: dict[str, Fault], realisation: dict) -> dict:
-    """The realisations row for `<rupture>/R<n>`."""
+def build_realisation(row: ManifestRow, realisation: dict) -> dict:
+    """The realisations row, from the realisation's own realisation.json and geometry."""
+    geometries = fault_geometries(realisation)
     causality_tree = realisation["rupture_propagation"]["rupture_causality_tree"]
     initial_fault = initial_fault_name(causality_tree)
     hypocentre_sd = realisation["rupture_propagation"]["hypocentre"]
@@ -416,8 +588,8 @@ def build_realisation(rupture: str, n: int, geometries: dict[str, Fault], realis
         np.array([hypocentre_sd["s"], hypocentre_sd["d"]])
     )
     return {
-        "rel_id": rel_id(rupture, n),
-        "event_id": rupture,
+        "rel_id": row.rel_id,
+        "event_id": row.event_id,
         "magnitude": total_magnitude(realisation),
         "rake": realisation["rakes"]["rakes"][initial_fault],
         "hypo_lat": float(hypo_lat),
@@ -425,6 +597,7 @@ def build_realisation(rupture: str, n: int, geometries: dict[str, Fault], realis
         "hypo_depth": float(hypo_depth_m) / 1000,
         "metadata": json.dumps(
             {
+                "pilot": row.pilot,
                 "seeds": realisation["seeds"],
                 "segment_magnitudes_boldm": realisation["magnitudes"]["magnitudes"],
                 "rupture_causality_tree": causality_tree,
@@ -448,6 +621,15 @@ def check_against_h5(rel: str, realisation_row: dict, attrs: dict[str, float]) -
 # ---- build and verify ----------------------------------------------------------
 
 
+@dataclass
+class Loaded:
+    """One realisation read from disk."""
+
+    row: ManifestRow
+    realisation: dict
+    ims: RealisationIMs
+
+
 def check_row_counts(db: IMDB, expected: dict[str, int]) -> None:
     """Raise unless every table has exactly the expected number of rows."""
     for table, n in expected.items():
@@ -456,22 +638,72 @@ def check_row_counts(db: IMDB, expected: dict[str, int]) -> None:
             raise RuntimeError(f"{table}: {found} rows, expected {n}")
 
 
+# Counts the flagged site_event rows three ways, from the tables alone: the rows
+# flagged; the (site, event) pairs where only a pilot realisation has records in
+# an event that also has main realisations; and the overlap of the two.
+FLAG_QUERY = """
+WITH rel AS (
+    SELECT rel_int_id, event_int_id,
+           coalesce(json_extract_string(metadata, '$.pilot') = 'true', false) AS pilot
+    FROM realisations
+), site_rel AS (
+    SELECT DISTINCT records.site_int_id, records.event_int_id, rel.pilot
+    FROM records JOIN rel USING (rel_int_id)
+), pilot_only AS (
+    SELECT site_int_id, event_int_id FROM site_rel
+    GROUP BY site_int_id, event_int_id HAVING bool_and(pilot)
+), shared AS (
+    SELECT event_int_id FROM rel GROUP BY event_int_id HAVING bool_or(pilot) AND bool_or(NOT pilot)
+)
+SELECT
+    (SELECT count(*) FROM site_event WHERE metadata IS NOT NULL),
+    (SELECT count(*) FROM pilot_only WHERE event_int_id IN (SELECT event_int_id FROM shared)),
+    (SELECT count(*) FROM site_event JOIN pilot_only USING (site_int_id, event_int_id)
+     WHERE site_event.metadata IS NOT NULL
+       AND site_event.event_int_id IN (SELECT event_int_id FROM shared))
+"""
+
+
+def check_flags(db: IMDB, n_flagged: int) -> None:
+    """Raise unless the flagged site_event rows are exactly the pilot-only sites of shared events."""
+    flagged, pilot_only, both = db.con.raw_sql(FLAG_QUERY).fetchone()
+    if not flagged == pilot_only == both == n_flagged:
+        raise RuntimeError(
+            f"site_event flags: {flagged} flagged rows, {pilot_only} pilot-only sites in "
+            f"shared events, {both} in both, {n_flagged} written"
+        )
+
+
 def spot_check(
-    db_path: Path, share_dir: Path, n_realisations: int = 25, per_realisation: int = 40, seed: int = 0
+    db_path: Path,
+    manifest: dict[str, ManifestRow],
+    n_realisations: int = 25,
+    per_realisation: int = 40,
+    min_pilot: int = 5,
+    seed: int = 0,
 ) -> int:
-    """Re-read random records from their h5 and compare exactly; return how many."""
+    """Re-read random records from their h5 and compare exactly; return how many.
+
+    At least `min_pilot` of the sampled realisations are pilot ones, where there are any.
+    """
     rng = np.random.default_rng(seed)
+    pilot_rels = sorted(rel for rel, row in manifest.items() if row.pilot)
+    main_rels = sorted(rel for rel, row in manifest.items() if not row.pilot)
+    n_pilot = min(len(pilot_rels), max(min_pilot, n_realisations - len(main_rels)))
+    n_main = min(len(main_rels), n_realisations - n_pilot)
+    chosen = [
+        *rng.choice(pilot_rels, size=n_pilot, replace=False),
+        *rng.choice(main_rels, size=n_main, replace=False),
+    ]
     checked = 0
     with IMDB(db_path) as db:
-        rels = sorted(db.get_realisations().index)
-        for rel in rng.choice(rels, size=min(n_realisations, len(rels)), replace=False):
-            rupture, n = rel.rsplit("_R", 1)
+        for rel in chosen:
             records = db.get_records(rel_ids=[rel])
             sample = records.sample(n=min(per_realisation, len(records)), random_state=seed)
             ids = sample.index.tolist()
             psa = db.get_psa(record_int_ids=ids)
             scalars = db.get_scalars(record_int_ids=ids)
-            ims = read_ims(share_dir / rupture / f"R{n}" / "intensity_measures.h5")
+            ims = read_ims(manifest[rel].im_path)
             row_of = {site: i for i, site in enumerate(ims.stations)}
             for record_int_id, record in sample.iterrows():
                 i, component = row_of[record["site_id"]], record["component"]
@@ -490,22 +722,35 @@ def spot_check(
     return checked
 
 
+def peak_line(row: ManifestRow, peak: dict[str, tuple[float, str]]) -> str:
+    """One realisation's largest PGA and PGV (geom), with where they are."""
+    (pga, pga_site), (pgv, pgv_site) = peak["PGA"], peak["PGV"]
+    return f"{row.label}: PGA {pga:.3f} g at {pga_site}; PGV {pgv:.1f} cm/s at {pgv_site}"
+
+
+def print_peaks(peaks: Sequence[tuple[ManifestRow, dict[str, tuple[float, str]]]]) -> None:
+    """The realisations with the largest PGA, for a human to judge before the database is shared."""
+    ranked = sorted(peaks, key=lambda item: item[1]["PGA"][0], reverse=True)
+    print(f"top {min(N_TOP_PEAKS, len(ranked))} realisations by max PGA (geom):", flush=True)
+    for row, peak in ranked[:N_TOP_PEAKS]:
+        print(f"  {peak_line(row, peak)}", flush=True)
+
+
 def build_database(
-    share_dir: Path,
-    events_dir: Path,
+    manifest_path: Path,
     stations_input: Path,
     nshm_csv: Path,
-    realisations: Sequence[tuple[str, int]],
     out_path: Path,
-    source: str,
+    harvested_at: str,
     script_commit: str,
     memory_limit: str | None = None,
 ) -> dict[str, int]:
     """Build the database at out_path and return its table row counts.
 
     Writes `<out_path>.partial` and renames it only once validation, the row
-    counts and the spot check have all passed. A failure leaves the .partial
-    behind for inspection, and the next run refuses to start until it is removed.
+    counts, the site_event flags and the spot check have all passed. A failure
+    leaves the .partial behind for inspection, and the next run refuses to
+    start until it is removed.
     """
     if out_path.exists():
         raise FileExistsError(f"{out_path} already exists")
@@ -513,14 +758,13 @@ def build_database(
     if partial.exists():
         raise FileExistsError(f"{partial} exists: a previous run died; remove it first")
 
+    rows = read_manifest(manifest_path)
+    by_event = group_by_event(rows)
     stations = load_stations_input(stations_input)
     nshm = load_nshm_attributes(nshm_csv)
-    by_rupture = group_by_rupture(realisations)
-    missing = sorted(set(by_rupture) - set(nshm.index), key=int)
+    missing = sorted(set(by_event) - set(nshm.index), key=int)
     if missing:
         raise ValueError(f"ruptures missing from {nshm_csv}: {missing}")
-    (nshmdb_file,) = nshm["nshmdb_file"].unique()
-    (nshmdb_sha256,) = nshm["nshmdb_sha256"].unique()
 
     db = IMDB.create(
         partial,
@@ -528,57 +772,79 @@ def build_database(
         components=COMPONENTS,
         db_meta={
             **DB_META,
-            "source": source,
-            "n_realisations": str(len(realisations)),
-            "nshmdb": f"{nshmdb_file} sha256 {nshmdb_sha256}",
+            "n_realisations": str(len(rows)),
+            "n_pilot_realisations": str(sum(row.pilot for row in rows)),
+            "im_calc_harvested_at": harvested_at,
+            "build_manifest_md5": md5_of(manifest_path),
             "ingest_script_commit": script_commit,
         },
     )
     counts = dict.fromkeys(("events", "realisations", "sites", "site_event", "records"), 0)
+    n_flagged = 0
+    seeds_seen: dict[str, str] = {}
+    peaks: list[tuple[ManifestRow, dict[str, tuple[float, str]]]] = []
     started = time.monotonic()
     try:
         if memory_limit:
             db.con.raw_sql(f"SET memory_limit = '{memory_limit}'")
         sites = SiteRegistry(stations)
-        for index, (rupture, ns) in enumerate(by_rupture.items(), start=1):
+        for index, (event_id, group) in enumerate(by_event.items(), start=1):
             loaded = []
-            for n in ns:
-                rel = rel_id(rupture, n)
-                realisation = json.loads((events_dir / rupture / f"R{n}" / "realisation.json").read_text())
-                h5_path = share_dir / rupture / f"R{n}" / "intensity_measures.h5"
-                if not h5_path.exists():
-                    raise FileNotFoundError(f"{rel}: no {h5_path}")
-                ims = read_ims(h5_path)
-                check_finite(rel, ims)
-                loaded.append((n, realisation, ims))
+            for row in group:
+                for path in (row.im_path, row.realisation_path):
+                    if not path.exists():
+                        raise FileNotFoundError(f"{row.label}: no {path}")
+                realisation = json.loads(row.realisation_path.read_text())
+                seeds = json.dumps(realisation["seeds"], sort_keys=True)
+                if seeds in seeds_seen:
+                    raise ValueError(f"{row.label}: the same seeds as {seeds_seen[seeds]}")
+                seeds_seen[seeds] = row.rel_id
+                ims = read_ims(row.im_path)
+                check_finite(row.label, ims)
+                loaded.append(Loaded(row, realisation, ims))
+                peaks.append((row, ims.peaks))
+                print(f"peak {peak_line(row, ims.peaks)}", flush=True)
 
-            first_n, first_realisation, first_ims = loaded[0]
-            event, geometries = build_event(rupture, first_realisation, nshm.loc[rupture])
-            rows = []
-            for n, realisation, ims in loaded:
-                row = build_realisation(rupture, n, geometries, realisation)
-                check_against_h5(row["rel_id"], row, ims.attrs)
-                check_matches_first_realisation(row["rel_id"], rel_id(rupture, first_n), ims, first_ims)
-                rows.append(row)
-            new_sites = sites.new_sites(rupture, first_ims)
+            mains = [x for x in loaded if not x.row.pilot]
+            pilots = [x for x in loaded if x.row.pilot]
+            defining = mains[0] if mains else pilots[0]
+            event = build_event(
+                event_id,
+                defining.realisation,
+                [x.realisation for x in loaded],
+                nshm.loc[event_id],
+                MAIN_RELEASE if mains else PILOT_RELEASE,
+            )
+            realisation_rows = []
+            for x in loaded:
+                realisation_row = build_realisation(x.row, x.realisation)
+                check_against_h5(x.row.label, realisation_row, x.ims.attrs)
+                realisation_rows.append(realisation_row)
+            for x in mains[1:]:
+                check_matches_first_realisation(x.row.label, mains[0].row.label, x.ims, mains[0].ims)
+            new_sites = pd.concat([sites.new_sites(x.row.label, x.ims) for x in loaded], ignore_index=True)
+            site_event, flagged = build_site_event(
+                event_id, mains[0].ims if mains else None, pilots[0].ims if pilots else None
+            )
 
             db.add_events(pd.DataFrame([event]))
-            db.add_realisations(pd.DataFrame(rows))
+            db.add_realisations(pd.DataFrame(realisation_rows))
             if len(new_sites):
                 db.add_sites(new_sites)
-            db.add_site_event(build_site_event(rupture, first_ims))
-            for n, _, ims in loaded:
-                records, psa = build_records(rel_id(rupture, n), ims)
+            db.add_site_event(site_event)
+            for x in loaded:
+                records, psa = build_records(x.row.rel_id, x.ims)
                 db.add_records(records, pSA=psa)
                 counts["records"] += len(records)
 
             counts["events"] += 1
             counts["realisations"] += len(loaded)
             counts["sites"] += len(new_sites)
-            counts["site_event"] += len(first_ims.stations)
-            if index % 25 == 0 or index == len(by_rupture):
+            counts["site_event"] += len(site_event)
+            n_flagged += flagged
+            if index % 25 == 0 or index == len(by_event):
                 print(
-                    f"{index}/{len(by_rupture)} ruptures, {counts['records']} records, "
+                    f"{index}/{len(by_event)} events, {counts['records']} records, "
                     f"{time.monotonic() - started:.0f} s",
                     flush=True,
                 )
@@ -588,11 +854,17 @@ def build_database(
             raise RuntimeError(f"validate(): {problems}")
         expected = {**counts, "psa_ims": counts["records"], "scalars_ims": counts["records"]}
         check_row_counts(db, expected)
+        check_flags(db, n_flagged)
     finally:
         db.close()
 
-    checked = spot_check(partial, share_dir)
-    print(f"validate() clean; row counts match; spot check: {checked} records identical to their h5")
+    checked = spot_check(partial, {row.rel_id: row for row in rows})
+    print(
+        f"validate() clean; row counts match; {n_flagged} site_event rows carry the "
+        f"pilot's distances; spot check: {checked} records identical to their h5",
+        flush=True,
+    )
+    print_peaks(peaks)
     partial.rename(out_path)
     return expected
 
@@ -601,13 +873,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("share_dir", type=Path, help="run3 share/: <rupture>/R<n>/intensity_measures.h5")
-    parser.add_argument("events_dir", type=Path, help="run3 events/: <rupture>/R<n>/realisation.json")
+    parser.add_argument("manifest", type=Path, help="build manifest CSV from build_imdb_manifest.py")
     parser.add_argument("stations_input", type=Path, help="the campaign's stations_input.ll (lon lat name)")
     parser.add_argument("nshm_csv", type=Path, help="campaign_nshm_ruptures.csv from export_nshm_rupture_attributes.py")
-    parser.add_argument("realisations_file", type=Path, help="one <rupture>/R<n> per line")
     parser.add_argument("out", type=Path, help="output .duckdb; must not exist")
-    parser.add_argument("--source", required=True, help="provenance for db_meta.source")
+    parser.add_argument("--harvested-at", required=True, help="when the manifest was built from cylc, UTC ISO 8601")
     parser.add_argument("--script-commit", required=True, help="git commit of this script, for db_meta")
     parser.add_argument(
         "--memory-limit",
@@ -616,16 +886,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    realisations = parse_realisation_ids(args.realisations_file.read_text().splitlines())
-    print(f"ingesting {len(realisations)} realisations into {args.out}", flush=True)
+    print(f"ingesting {args.manifest} into {args.out}", flush=True)
     counts = build_database(
-        args.share_dir,
-        args.events_dir,
+        args.manifest,
         args.stations_input,
         args.nshm_csv,
-        realisations,
         args.out,
-        source=args.source,
+        harvested_at=args.harvested_at,
         script_commit=args.script_commit,
         memory_limit=args.memory_limit,
     )

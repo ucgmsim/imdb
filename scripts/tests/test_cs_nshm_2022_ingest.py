@@ -1,10 +1,12 @@
-"""Tests for scripts/cs_nshm_2022_ingest.py, on a synthetic campaign in run3's layout.
+"""Tests for scripts/cs_nshm_2022_ingest.py, on a synthetic two-campaign dataset.
 
 imdb's own CI installs neither h5py nor source-modelling, so this module skips
 there. Run it inside the imdb_tools image:
     apptainer exec imdb_tools_<date>.sif python3 -m pytest -q scripts/tests
 """
 
+import csv
+import hashlib
 import importlib.util
 import json
 import sys
@@ -19,6 +21,7 @@ h5py = pytest.importorskip("h5py")
 pytest.importorskip("source_modelling")
 
 from imdb import IMDB  # noqa: E402
+from shapely import unary_union, wkt  # noqa: E402
 from source_modelling import moment, sources  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / "cs_nshm_2022_ingest.py"
@@ -38,6 +41,7 @@ VALID_PERIODS = (
     4.2, 4.4, 4.6, 4.8, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0, 11.0, 12.0,
     13.0, 14.0, 15.0, 20.0,
 )  # fmt: skip
+FAS_FREQUENCIES = (0.1, 1.0, 10.0)
 ALL_COMPONENTS = ("000", "090", "ver", "geom", "rotd0", "rotd50", "rotd100")
 AS_RECORDED = ("000", "090", "ver", "geom")
 H5_GROUPS = {
@@ -60,7 +64,7 @@ STATIONS_INPUT = {
     "2TfEMSL": (172.4, -43.4),
     "2TfFKSL": (172.5, -43.5),
 }
-# vs30, z1pt0, z2pt5 per station: global, like the real campaign's.
+# vs30, z1pt0, z2pt5 per station: global, like the real campaigns'.
 SITE_VALUES = {
     "AMBC": (300.0, 0.3, 1.3),
     "2O8aUSL": (400.0, 0.2, 1.2),
@@ -68,6 +72,7 @@ SITE_VALUES = {
     "2TfEMSL": (600.0, 0.1, 1.0),
     "2TfFKSL": (700.0, 0.05, 0.9),
 }
+MAIN_SHA256 = "3fe692cb9b22c769b6a9baa6a526b4eed989bd61ec054a344f0e74d82855bc4e"
 
 
 def _plane(lat: float, lon: float, strike: float) -> sources.Plane:
@@ -83,6 +88,8 @@ def _realisation(
     tree: dict[str, str | None],
     hypocentre: tuple[float, float],
     duration: float,
+    seed: int,
+    domain_shift: float = 0.0,
 ) -> dict:
     return {
         "metadata": {"name": f"Rupture {name}"},
@@ -103,13 +110,13 @@ def _realisation(
             "rupture_causality_tree": tree,
             "hypocentre": {"s": hypocentre[0], "d": hypocentre[1]},
         },
-        "seeds": {"hf_seed": 7},
+        "seeds": {"hf_seed": seed, "genslip_seed": 1000 + seed},
         "domain": {
             "domain": [
-                {"latitude": -43.0, "longitude": 172.0},
-                {"latitude": -43.0, "longitude": 173.0},
-                {"latitude": -44.0, "longitude": 173.0},
-                {"latitude": -44.0, "longitude": 172.0},
+                {"latitude": -43.0 + domain_shift, "longitude": 172.0 + domain_shift},
+                {"latitude": -43.0 + domain_shift, "longitude": 173.0 + domain_shift},
+                {"latitude": -44.0 + domain_shift, "longitude": 173.0 + domain_shift},
+                {"latitude": -44.0 + domain_shift, "longitude": 172.0 + domain_shift},
             ],
             "duration": duration,
             "depth": 40.0,
@@ -167,98 +174,143 @@ def _write_h5(path: Path, stations: list[str], realisation: dict, distances: np.
                 for c in components:
                     group[c] = rng.uniform(1e-3, 2.0, (n, len(VALID_PERIODS)))
             elif group_name == "FAS":
-                group["frequency"] = np.array([0.1, 1.0, 10.0])
+                group["frequency"] = np.array(FAS_FREQUENCIES)
                 for c in components:
-                    group[c] = rng.uniform(size=(n, 3))
+                    group[c] = rng.uniform(size=(n, len(FAS_FREQUENCIES)))
             else:
                 for c in components:
                     group[c] = rng.uniform(0.01, 5.0, n)
 
 
+def _write_manifest(path: Path, rows: list[dict[str, str]]) -> None:
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 @dataclass
 class Campaign:
-    share: Path
-    events: Path
+    manifest: Path
+    files: dict[str, tuple[Path, Path]]
+    """original_id -> (intensity_measures.h5, realisation.json)"""
     stations_input: Path
     nshm_csv: Path
-    realisations: list[tuple[str, int]]
     out: Path
 
-    def h5(self, rel: str) -> Path:
-        rupture, n = rel.split("/R")
-        return self.share / rupture / f"R{n}" / "intensity_measures.h5"
+    def h5(self, original_id: str) -> Path:
+        return self.files[original_id][0]
 
-    def realisation_json(self, rel: str) -> Path:
-        rupture, n = rel.split("/R")
-        return self.events / rupture / f"R{n}" / "realisation.json"
+    def realisation_json(self, original_id: str) -> Path:
+        return self.files[original_id][1]
+
+    def realisation(self, original_id: str) -> dict:
+        return json.loads(self.realisation_json(original_id).read_text())
 
     def build(self) -> dict[str, int]:
         return ingest.build_database(
-            self.share,
-            self.events,
+            self.manifest,
             self.stations_input,
             self.nshm_csv,
-            self.realisations,
             self.out,
-            source="pytest",
+            harvested_at="2026-09-23T07:35:00Z",
             script_commit="abc123",
         )
 
 
-RUPTURE_STATIONS = {
-    "161984": ["AMBC", "2O8aUSL", "2O8bSSL", "2TfEMSL"],
-    "288271": ["2O8bSSL", "2TfEMSL", "2TfFKSL"],
-}
-NSHM_MAGNITUDE = {"161984": 7.480455658305042, "288271": 7.13806256610197}
+# (original_id, rel_id, pilot, stations) in manifest order
+REALISATIONS = [
+    ("3", "3_R1", True, ["AMBC", "2O8aUSL"]),
+    ("161984/R2", "161984_R1", False, ["AMBC", "2O8aUSL", "2O8bSSL", "2TfEMSL"]),
+    ("161984/R3", "161984_R2", False, ["AMBC", "2O8aUSL", "2O8bSSL", "2TfEMSL"]),
+    ("288271/R2", "288271_R1", False, ["2O8bSSL", "2TfEMSL", "2TfFKSL"]),
+    ("288271", "288271_R2", True, ["2TfEMSL", "2TfFKSL", "AMBC", "2O8aUSL"]),
+]
+STATIONS = {original_id: stations for original_id, _, _, stations in REALISATIONS}
+NSHM_MAGNITUDE = {"3": 6.9, "161984": 7.480455658305042, "288271": 7.13806256610197}
 
 
 @pytest.fixture
 def campaign(tmp_path: Path) -> Campaign:
-    """Two ruptures: 161984 (two faults, R2 and R3) and 288271 (one fault, R2)."""
-    share, events = tmp_path / "share", tmp_path / "events"
+    """Three events.
+
+    - 161984: two main realisations on two faults.
+    - 288271: one main realisation and a pilot whose fault's bottom edge sits
+      elsewhere, whose domain is shifted, and whose stations only partly overlap.
+    - 3: a pilot realisation alone.
+    """
     two_faults = {"Clarence": _plane(-43.5, 172.5, 45.0), "Kekerengu": _plane(-43.45, 172.58, 50.0)}
-    one_fault = {"Monowai": _plane(-43.6, 172.4, 30.0)}
     realisations = {
+        "3": _realisation("3", {"Acton": _plane(-43.2, 172.2, 10.0)}, {"Acton": 6.8}, {"Acton": None}, (0.4, 0.5), 90.0, 1),
         "161984/R2": _realisation(
             "161984", two_faults, {"Clarence": 7.11, "Kekerengu": 6.59},
-            {"Kekerengu": "Clarence", "Clarence": None}, (0.17, 0.19), 161.7,
+            {"Kekerengu": "Clarence", "Clarence": None}, (0.17, 0.19), 161.7, 2,
         ),
         "161984/R3": _realisation(
             "161984", two_faults, {"Clarence": 6.54, "Kekerengu": 6.02},
-            {"Clarence": "Kekerengu", "Kekerengu": None}, (0.59, 0.92), 156.5,
+            {"Clarence": "Kekerengu", "Kekerengu": None}, (0.59, 0.92), 156.5, 3,
         ),
         "288271/R2": _realisation(
-            "288271", one_fault, {"Monowai": 7.32}, {"Monowai": None}, (0.5, 0.6), 120.0,
+            "288271", {"Monowai": _plane(-43.6, 172.4, 30.0)}, {"Monowai": 7.32}, {"Monowai": None}, (0.5, 0.6), 120.0, 4,
+        ),
+        "288271": _realisation(
+            "288271", {"Monowai": _plane(-43.6, 172.4, 33.0)}, {"Monowai": 7.14}, {"Monowai": None}, (0.1, 0.9), 110.0, 5,
+            domain_shift=0.2,
         ),
     }  # fmt: skip
     rng = np.random.default_rng(1)
-    distances = {rupture: rng.uniform(0, 80, (len(s), 4)) for rupture, s in RUPTURE_STATIONS.items()}
-    for seed, (rel, realisation) in enumerate(realisations.items()):
-        rupture = rel.split("/")[0]
-        path = events / rel / "realisation.json"
-        path.parent.mkdir(parents=True)
-        path.write_text(json.dumps(realisation))
-        _write_h5(share / rel / "intensity_measures.h5", RUPTURE_STATIONS[rupture], realisation, distances[rupture], seed)
+    distances = {
+        "3": rng.uniform(0, 80, (2, 4)),
+        "161984": rng.uniform(0, 80, (4, 4)),
+        "288271/R2": rng.uniform(0, 80, (3, 4)),
+        "288271": rng.uniform(0, 80, (4, 4)),
+    }
+    files, rows = {}, []
+    for seed, (original_id, rel, pilot, stations) in enumerate(REALISATIONS):
+        base = tmp_path / ("pilot" if pilot else "main") / original_id
+        h5_path, json_path = base / "intensity_measures.h5", base / "realisation.json"
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(realisations[original_id]))
+        rupture_distances = distances["161984"] if original_id.startswith("161984") else distances[original_id]
+        _write_h5(h5_path, stations, realisations[original_id], rupture_distances, seed)
+        files[original_id] = (h5_path, json_path)
+        event_id, n = rel.split("_R")
+        rows.append(
+            {
+                "rel_id": rel,
+                "event_id": event_id,
+                "realisation": n,
+                "pilot": "true" if pilot else "false",
+                "campaign": "run2" if pilot else "run3",
+                "original_id": original_id,
+                "im_path": str(h5_path),
+                "realisation_path": str(json_path),
+            }
+        )
+    manifest = tmp_path / "manifest.csv"
+    _write_manifest(manifest, rows)
 
     stations_input = tmp_path / "stations_input.ll"
     stations_input.write_text("".join(f"{lon} {lat} {s}\n" for s, (lon, lat) in STATIONS_INPUT.items()))
     nshm_csv = tmp_path / "campaign_nshm_ruptures.csv"
     pd.DataFrame(
         {
-            "rupture_id": ["607", "161984", "288271"],
-            "nshmdb_rupture_id": [40083, 201460, 327747],
-            "magnitude_boldm": [7.47, NSHM_MAGNITUDE["161984"], NSHM_MAGNITUDE["288271"]],
-            "area_km2": [1872.5, 1907.5, 867.1],
-            "length_km": [59.9, 80.2, 34.6],
-            "annual_rate": [6.1e-06, 1.86e-04, 7.97e-05],
+            "rupture_id": ["3", "607", "161984", "288271"],
+            "nshmdb_rupture_id": [3001, 40083, 201460, 327747],
+            "magnitude_boldm": [NSHM_MAGNITUDE["3"], 7.47, NSHM_MAGNITUDE["161984"], NSHM_MAGNITUDE["288271"]],
+            "area_km2": [300.0, 1872.5, 1907.5, 867.1],
+            "length_km": [20.0, 59.9, 80.2, 34.6],
+            "annual_rate": [1e-05, 6.1e-06, 1.86e-04, 7.97e-05],
             "nshmdb_file": "nshmdb_v2026.08.3.db",
-            "nshmdb_sha256": "3fe692cb",
+            "nshmdb_sha256": MAIN_SHA256,
         }
     ).to_csv(nshm_csv, index=False)
-    return Campaign(
-        share, events, stations_input, nshm_csv,
-        [("161984", 2), ("161984", 3), ("288271", 2)], tmp_path / "out.duckdb",
-    )  # fmt: skip
+    return Campaign(manifest, files, stations_input, nshm_csv, tmp_path / "out.duckdb")
+
+
+def _manifest_rows(campaign: Campaign) -> list[dict[str, str]]:
+    with campaign.manifest.open(newline="") as f:
+        return list(csv.DictReader(f))
 
 
 # ---- helpers -------------------------------------------------------------------
@@ -276,17 +328,44 @@ def test_select_period_indices_rejects_a_missing_period():
         ingest.select_period_indices(without)
 
 
-def test_parse_realisation_ids():
-    lines = ["161984/R3", "", "607/R2", "161984/R2", "607/R2"]
-    assert ingest.parse_realisation_ids(lines) == [("607", 2), ("161984", 2), ("161984", 3)]
-    with pytest.raises(ValueError, match="161984_R2"):
-        ingest.parse_realisation_ids(["161984_R2"])
-
-
 def test_is_real_station():
     assert ingest.is_real_station("AMBC")
     assert ingest.is_real_station("BFZ")
     assert not ingest.is_real_station("2O8aUSL")
+
+
+def test_read_manifest_returns_ingest_order(campaign: Campaign):
+    rows = _manifest_rows(campaign)
+    _write_manifest(campaign.manifest, rows[::-1])
+    parsed = ingest.read_manifest(campaign.manifest)
+    assert [row.rel_id for row in parsed] == ["3_R1", "161984_R1", "161984_R2", "288271_R1", "288271_R2"]
+    assert [row.pilot for row in parsed] == [True, False, False, False, True]
+    assert parsed[1].original_id == "161984/R2"
+    assert parsed[1].im_path == campaign.h5("161984/R2")
+
+
+def _set(rows: list[dict[str, str]], rel: str, **changes: str) -> list[dict[str, str]]:
+    return [{**row, **changes} if row["rel_id"] == rel else row for row in rows]
+
+
+@pytest.mark.parametrize(
+    "edit, match",
+    [
+        (lambda rows: _set(rows, "161984_R2", rel_id="161984_R3", realisation="3"), r"realisations \[1, 3\]"),
+        (lambda rows: _set(_set(rows, "288271_R1", pilot="true"), "288271_R2", pilot="false"), "the pilot is R1"),
+        (lambda rows: _set(rows, "288271_R1", pilot="true"), "2 pilot realisations"),
+        (lambda rows: [*rows, rows[0]], "3_R1: listed twice"),
+        (lambda rows: _set(rows, "3_R1", rel_id="3_R9"), "3_R9: expected 3_R1"),
+        (lambda rows: _set(rows, "3_R1", event_id="03", rel_id="03_R1"), "not an unpadded integer"),
+        (lambda rows: _set(rows, "3_R1", pilot="yes"), "pilot must be true or false"),
+        (lambda rows: [{k: v for k, v in row.items() if k != "original_id"} for row in rows], "missing columns"),
+    ],
+    ids=["gap", "pilot-not-last", "two-pilots", "duplicate", "rel-id-mismatch", "padded-event", "bad-pilot", "no-column"],
+)  # fmt: skip
+def test_bad_manifests_are_refused(campaign: Campaign, edit, match):
+    _write_manifest(campaign.manifest, edit(_manifest_rows(campaign)))
+    with pytest.raises(ValueError, match=match):
+        ingest.read_manifest(campaign.manifest)
 
 
 # ---- the whole build -------------------------------------------------------------
@@ -295,62 +374,99 @@ def test_is_real_station():
 def test_row_counts_and_meta(campaign: Campaign):
     counts = campaign.build()
     assert counts == {
-        "events": 2,
-        "realisations": 3,
+        "events": 3,
+        "realisations": 5,
         "sites": 5,
-        "site_event": 7,
-        "records": 22,
-        "psa_ims": 22,
-        "scalars_ims": 22,
+        "site_event": 11,  # 2 + 4 + (3 main + 2 only the pilot has)
+        "records": 34,
+        "psa_ims": 34,
+        "scalars_ims": 34,
     }
     assert campaign.out.exists()
     assert not campaign.out.with_name("out.duckdb.partial").exists()
     with IMDB(campaign.out) as db:
         meta = db.db_meta
         assert db.validate() == []
-    assert meta["dataset_id"] == "cs_nshm_2022_run3"
+    assert meta["dataset_id"] == "cs_nshm_2022"
     assert meta["components"] == "geom,rotd50"
     assert meta["n_periods"] == "25"
     assert meta["n_frequencies"] == "0"
-    assert meta["magnitude_convention"].startswith("BoldM")
-    assert meta["nshmdb"] == "nshmdb_v2026.08.3.db sha256 3fe692cb"
+    assert meta["n_realisations"] == "5"
+    assert meta["n_pilot_realisations"] == "2"
+    assert meta["im_calc_harvested_at"] == "2026-09-23T07:35:00Z"
+    assert meta["build_manifest_md5"] == hashlib.md5(campaign.manifest.read_bytes()).hexdigest()
     assert meta["ingest_script_commit"] == "abc123"
-    assert meta["source"] == "pytest"
-    assert meta["n_realisations"] == "3"
+    assert meta["magnitude_convention"].startswith("BoldM")
+    for key in ("description", "realisation_numbering", "pilot_realisations", "distances", "nshm_fault_database"):
+        assert meta[key]
+    assert "source" not in meta and "nshmdb" not in meta
+    for key, value in meta.items():  # nothing researcher-facing names our internals
+        for word in ("run2", "run3", "/gpfs", "BSC", "envelope"):
+            assert word not in value, f"db_meta {key} mentions {word}"
 
 
 def test_events(campaign: Campaign):
     campaign.build()
     with IMDB(campaign.out) as db:
         events = db.get_events()
-    assert events.loc["161984", "magnitude"] == pytest.approx(NSHM_MAGNITUDE["161984"], abs=1e-6)
-    assert events.loc["288271", "magnitude"] == pytest.approx(NSHM_MAGNITUDE["288271"], abs=1e-6)
+    for event_id, magnitude in NSHM_MAGNITUDE.items():
+        assert events.loc[event_id, "magnitude"] == pytest.approx(magnitude, abs=1e-6)
     assert (events["tect_type"] == "ACTIVE_SHALLOW").all()
     assert pd.isna(events.loc["161984", "dip"])  # multi-fault: no single dip
     assert events.loc["288271", "dip"] == pytest.approx(60.0, abs=1e-3)
-    assert events.loc["288271", "length"] == pytest.approx(10.0, abs=1e-3)
-    metadata = json.loads(events.loc["161984", "metadata"])
-    assert metadata["nshmdb_rupture_id"] == 201460
-    assert metadata["annual_rate"] == 1.86e-04
-    assert set(metadata["segments"]) == {"Clarence", "Kekerengu"}
-    assert events.loc["161984", "source_wkt"].startswith("MULTIPOLYGON")
+    metadata = {e: json.loads(events.loc[e, "metadata"]) for e in NSHM_MAGNITUDE}
+    assert metadata["161984"]["nshmdb_rupture_id"] == 201460
+    assert metadata["161984"]["annual_rate"] == 1.86e-04
+    assert set(metadata["161984"]["segments"]) == {"Clarence", "Kekerengu"}
+    assert {e: m["fault_geometry_release"] for e, m in metadata.items()} == {
+        "3": "pre-v2026.08",
+        "161984": "v2026.08.3",
+        "288271": "v2026.08.3",
+    }
 
 
-def test_realisations_are_boldm_and_match_their_h5(campaign: Campaign):
+def test_event_geometry_comes_from_the_main_realisation(campaign: Campaign):
+    campaign.build()
+    with IMDB(campaign.out) as db:
+        events = db.get_events()
+
+    def geometry_of(original_id: str) -> str:
+        return ingest.source_wkt(ingest.fault_geometries(campaign.realisation(original_id)))
+
+    assert events.loc["288271", "source_wkt"] == geometry_of("288271/R2")
+    assert events.loc["288271", "source_wkt"] != geometry_of("288271")
+    assert events.loc["3", "source_wkt"] == geometry_of("3")
+
+
+def test_domain_is_the_union_of_the_realisations_domains(campaign: Campaign):
+    campaign.build()
+    with IMDB(campaign.out) as db:
+        events = db.get_events()
+    main, pilot = (ingest.domain_polygon(campaign.realisation(o)) for o in ("288271/R2", "288271"))
+    stored = wkt.loads(events.loc["288271", "domain_wkt"])
+    assert stored.equals(unary_union([main, pilot]))
+    assert stored.area > main.area
+    assert wkt.loads(events.loc["161984", "domain_wkt"]).equals(ingest.domain_polygon(campaign.realisation("161984/R2")))
+
+
+def test_realisations_match_their_own_realisation_json(campaign: Campaign):
     campaign.build()
     with IMDB(campaign.out) as db:
         realisations = db.get_realisations()
-    for rel in ("161984/R2", "161984/R3", "288271/R2"):
-        realisation = json.loads(campaign.realisation_json(rel).read_text())
-        row = realisations.loc[rel.replace("/", "_")]
+    for original_id, rel, pilot, _ in REALISATIONS:
+        realisation = campaign.realisation(original_id)
+        row = realisations.loc[rel]
         assert row["magnitude"] == pytest.approx(_boldm_total(realisation), abs=1e-5)
+        # the pilot's hypocentre sits on the pilot's own fault, not the event's
         assert (row["hypo_lat"], row["hypo_lon"], row["hypo_depth"]) == pytest.approx(
             _hypocentre(realisation), abs=1e-4
         )
         metadata = json.loads(row["metadata"])
+        assert metadata["pilot"] is pilot
+        assert metadata["seeds"] == realisation["seeds"]
         assert metadata["duration_s"] == realisation["domain"]["duration"]
-    # R3 starts on the other fault, so its causality tree is its own
-    assert json.loads(realisations.loc["161984_R3", "metadata"])["rupture_causality_tree"]["Kekerengu"] is None
+    # 161984_R2 starts on the other fault, so its causality tree is its own
+    assert json.loads(realisations.loc["161984_R2", "metadata"])["rupture_causality_tree"]["Kekerengu"] is None
 
 
 def test_sites_use_canonical_coordinates(campaign: Campaign):
@@ -365,33 +481,63 @@ def test_sites_use_canonical_coordinates(campaign: Campaign):
     assert sites["is_real"].to_dict() == {s: s == "AMBC" for s in STATIONS_INPUT}
 
 
-def test_site_event_comes_from_the_h5(campaign: Campaign):
+def _h5_distances(path: Path) -> pd.DataFrame:
+    with h5py.File(path) as h5:
+        stations = [s.decode() for s in h5["pSA/station"][:]]
+        return pd.DataFrame({key: h5[f"pSA/{key}"][:] for key in ingest.DISTANCE_FIELDS}, index=stations)
+
+
+def test_site_event_prefers_the_main_campaign_and_flags_the_pilots(campaign: Campaign):
     campaign.build()
-    with h5py.File(campaign.h5("288271/R2")) as h5:
-        rrup = h5["pSA/rrup"][:]
     with IMDB(campaign.out) as db:
-        site_event = db.get_site_event(event_ids=["288271"]).set_index("site_id")
-    assert site_event.loc[RUPTURE_STATIONS["288271"], "rrup"].to_numpy() == pytest.approx(rrup, abs=1e-4)
+        site_event = db.get_site_event()
+    by_event = {e: df.set_index("site_id") for e, df in site_event.groupby("event_id")}
+    main, pilot = _h5_distances(campaign.h5("288271/R2")), _h5_distances(campaign.h5("288271"))
+    shared = by_event["288271"]
+    assert sorted(shared.index) == sorted(STATIONS_INPUT)
+    for site in STATIONS["288271/R2"]:  # the main realisation's stations, 2TfEMSL included
+        assert shared.loc[site, list(ingest.DISTANCE_FIELDS)].to_numpy() == pytest.approx(main.loc[site].to_numpy())
+        assert pd.isna(shared.loc[site, "metadata"])
+    for site in ("AMBC", "2O8aUSL"):  # only the pilot has these
+        assert shared.loc[site, list(ingest.DISTANCE_FIELDS)].to_numpy() == pytest.approx(pilot.loc[site].to_numpy())
+        assert json.loads(shared.loc[site, "metadata"]) == {"fault_geometry": "pilot"}
+    # the pilot-only event keeps the pilot's distances, unflagged
+    alone = _h5_distances(campaign.h5("3"))
+    for site in STATIONS["3"]:
+        assert by_event["3"].loc[site, list(ingest.DISTANCE_FIELDS)].to_numpy() == pytest.approx(alone.loc[site].to_numpy())
+    assert by_event["3"]["metadata"].isna().all()
+    assert by_event["161984"]["metadata"].isna().all()
 
 
 def test_ims_are_the_h5_values(campaign: Campaign):
     campaign.build()
-    with h5py.File(campaign.h5("161984/R3")) as h5:
-        columns = ingest.select_period_indices(h5["pSA/period"][:])
-        station = RUPTURE_STATIONS["161984"].index("2TfEMSL")
-        psa_rotd50 = h5["pSA/rotd50"][station, columns].astype(np.float32)
-        cav_geom = np.float32(h5["CAV/geom"][station])
-        pga_rotd50 = np.float32(h5["PGA/rotd50"][station])
-    with IMDB(campaign.out) as db:
-        rotd50 = db.get_records(rel_ids=["161984_R3"], site_ids=["2TfEMSL"], component="rotd50").index
-        geom = db.get_records(rel_ids=["161984_R3"], site_ids=["2TfEMSL"], component="geom").index
-        psa = db.get_psa(record_int_ids=list(rotd50))
-        scalars = db.get_scalars(record_int_ids=[*rotd50, *geom])
-    np.testing.assert_array_equal(psa.iloc[0].to_numpy(dtype=np.float32), psa_rotd50)
-    assert list(psa.columns) == [str(p) for p in ingest.PSA_PERIODS]
-    assert np.float32(scalars.loc[rotd50[0], "PGA"]) == pga_rotd50
-    assert pd.isna(scalars.loc[rotd50[0], "CAV"])  # undefined on rotd
-    assert np.float32(scalars.loc[geom[0], "CAV"]) == cav_geom
+    for original_id, rel in (("161984/R3", "161984_R2"), ("288271", "288271_R2")):
+        with h5py.File(campaign.h5(original_id)) as h5:
+            columns = ingest.select_period_indices(h5["pSA/period"][:])
+            station = STATIONS[original_id].index("2TfEMSL")
+            psa_rotd50 = h5["pSA/rotd50"][station, columns].astype(np.float32)
+            cav_geom = np.float32(h5["CAV/geom"][station])
+            pga_rotd50 = np.float32(h5["PGA/rotd50"][station])
+        with IMDB(campaign.out) as db:
+            rotd50 = db.get_records(rel_ids=[rel], site_ids=["2TfEMSL"], component="rotd50").index
+            geom = db.get_records(rel_ids=[rel], site_ids=["2TfEMSL"], component="geom").index
+            psa = db.get_psa(record_int_ids=list(rotd50))
+            scalars = db.get_scalars(record_int_ids=[*rotd50, *geom])
+        np.testing.assert_array_equal(psa.iloc[0].to_numpy(dtype=np.float32), psa_rotd50)
+        assert list(psa.columns) == [str(p) for p in ingest.PSA_PERIODS]
+        assert np.float32(scalars.loc[rotd50[0], "PGA"]) == pga_rotd50
+        assert pd.isna(scalars.loc[rotd50[0], "CAV"])  # undefined on rotd
+        assert np.float32(scalars.loc[geom[0], "CAV"]) == cav_geom
+
+
+def test_peaks_are_logged(campaign: Campaign, capsys: pytest.CaptureFixture):
+    campaign.build()
+    out = capsys.readouterr().out
+    with h5py.File(campaign.h5("288271")) as h5:
+        pga = h5["PGA/geom"][:]
+        site = h5["PGA/station"][int(np.argmax(pga))].decode()
+    assert f"peak 288271_R2 (288271): PGA {pga.max():.3f} g at {site}" in out
+    assert "top 5 realisations by max PGA (geom):" in out
 
 
 # ---- refusals and consistency checks -------------------------------------------
@@ -428,19 +574,29 @@ def _set_attr(path: Path, key: str, delta: float) -> None:
         h5.attrs[key] = h5.attrs[key] + delta
 
 
+def _edit_json(path: Path, edit) -> None:
+    realisation = json.loads(path.read_text())
+    edit(realisation)
+    path.write_text(json.dumps(realisation))
+
+
 @pytest.mark.parametrize(
     "corrupt, error, match",
     [
         (lambda c: _edit_h5(c.h5("288271/R2"), "geom", (0, KEPT_COLUMN), np.nan, ("pSA",)), ValueError, "pSA/geom has 1 non-finite"),
-        (lambda c: _edit_h5(c.h5("288271/R2"), "vs30", 1, 999.0), ValueError, "earlier rupture"),
-        (lambda c: _edit_h5(c.h5("161984/R3"), "rrup", 2, 1.5), ValueError, "rrup differs from 161984_R2"),
+        (lambda c: _edit_h5(c.h5("288271/R2"), "vs30", 1, 999.0), ValueError, "earlier realisation"),
+        (lambda c: _edit_h5(c.h5("288271"), "vs30", 0, 999.0), ValueError, r"288271_R2 \(288271\): 2TfEMSL"),
+        (lambda c: _edit_h5(c.h5("161984/R3"), "rrup", 2, 1.5), ValueError, r"rrup differs from 161984_R1 \(161984/R2\)"),
         (lambda c: _set_attr(c.h5("161984/R3"), "magnitude", 0.01), ValueError, "magnitude from realisation.json"),
-        (lambda c: _set_attr(c.h5("288271/R2"), "hypo_lat", 0.001), ValueError, "hypo_lat from realisation.json"),
+        (lambda c: _set_attr(c.h5("288271"), "hypo_lat", 0.001), ValueError, "hypo_lat from realisation.json"),
         (lambda c: c.stations_input.write_text(c.stations_input.read_text().replace("2TfFKSL", "XXXXXXX")),
          ValueError, "missing from stations_input.ll"),
-        (lambda c: c.h5("288271/R2").unlink(), FileNotFoundError, "288271_R2"),
+        (lambda c: c.h5("288271/R2").unlink(), FileNotFoundError, r"288271_R1 \(288271/R2\)"),
+        (lambda c: _edit_json(c.realisation_json("3"), lambda r: r.update(seeds=c.realisation("161984/R3")["seeds"])),
+         ValueError, "the same seeds as 3_R1"),
     ],
-    ids=["nan", "site-mismatch", "distance-mismatch", "magnitude", "hypocentre", "unknown-station", "no-h5"],
+    ids=["nan", "site-mismatch", "pilot-site-mismatch", "distance-mismatch", "magnitude", "hypocentre",
+         "unknown-station", "no-h5", "same-seeds"],
 )  # fmt: skip
 def test_bad_input_stops_the_build(campaign: Campaign, corrupt, error, match):
     corrupt(campaign)
@@ -449,21 +605,33 @@ def test_bad_input_stops_the_build(campaign: Campaign, corrupt, error, match):
     assert not campaign.out.exists()
 
 
+def test_the_pilots_distances_are_not_compared_with_the_main_campaigns(campaign: Campaign):
+    main, pilot = _h5_distances(campaign.h5("288271/R2")), _h5_distances(campaign.h5("288271"))
+    assert not np.allclose(main.loc["2TfEMSL"], pilot.loc["2TfEMSL"])
+    campaign.build()
+
+
 def test_unknown_tect_type_stops_the_build(campaign: Campaign):
-    path = campaign.realisation_json("288271/R2")
-    realisation = json.loads(path.read_text())
-    realisation["empirical"]["tect_type"] = "subduction_mystery"
-    path.write_text(json.dumps(realisation))
+    _edit_json(campaign.realisation_json("288271/R2"), lambda r: r["empirical"].update(tect_type="subduction_mystery"))
     with pytest.raises(ValueError, match="tect_type"):
         campaign.build()
 
 
 def test_rupture_missing_from_the_nshm_csv(campaign: Campaign):
-    pd.read_csv(campaign.nshm_csv).iloc[:2].to_csv(campaign.nshm_csv, index=False)
+    nshm = pd.read_csv(campaign.nshm_csv)
+    nshm[nshm["rupture_id"] != 288271].to_csv(campaign.nshm_csv, index=False)
     with pytest.raises(ValueError, match=r"missing from .*\['288271'\]"):
+        campaign.build()
+
+
+def test_nshm_attributes_from_another_release_are_refused(campaign: Campaign):
+    nshm = pd.read_csv(campaign.nshm_csv)
+    nshm.loc[0, "nshmdb_sha256"] = "00e25648"
+    nshm.to_csv(campaign.nshm_csv, index=False)
+    with pytest.raises(ValueError, match="must all come from v2026.08.3"):
         campaign.build()
 
 
 def test_nan_in_a_dropped_period_is_ignored(campaign: Campaign):
     _edit_h5(campaign.h5("288271/R2"), "geom", (0, DROPPED_COLUMN), np.nan, ("pSA",))
-    assert campaign.build()["records"] == 22
+    assert campaign.build()["records"] == 34
