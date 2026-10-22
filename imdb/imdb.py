@@ -577,10 +577,11 @@ class IMDB:
         if rows.empty:
             return None, sigma, has_sigma
         position = pd.Series(np.arange(len(record_int_ids)), index=record_int_ids)
-        for record_int_id, row in rows.iterrows():
-            ix = position.loc[record_int_id]
-            values[ix] = np.asarray(row[column], dtype=float)
-            row_sigma = row[f"{column}_sigma"]
+        positions = position.loc[rows.index].to_numpy()
+        for ix, row_values, row_sigma in zip(
+            positions, rows[column], rows[f"{column}_sigma"], strict=True
+        ):
+            values[ix] = np.asarray(row_values, dtype=float)
             if isinstance(row_sigma, list | np.ndarray) and len(row_sigma):
                 sigma[ix] = np.asarray(row_sigma, dtype=float)
                 has_sigma[ix] = True
@@ -691,17 +692,10 @@ class IMDB:
 
         # Insert records in groups that share which IM rows they have, so each copy
         # matches its source exactly: no empty scalars rows, no sigma on simulated records
-        groups = pd.DataFrame(
-            {
-                "scalars": has_scalars,
-                "psa_sigma": has_psa_sigma,
-                "fas_sigma": has_fas_sigma,
-            }
-        )
-        for (with_scalars, with_psa_sigma, with_fas_sigma), group in groups.groupby(
-            ["scalars", "psa_sigma", "fas_sigma"]
-        ):
-            ix = group.index.to_numpy()
+        groups = np.stack([has_scalars, has_psa_sigma, has_fas_sigma], axis=1)
+        for key in np.unique(groups, axis=0):
+            with_scalars, with_psa_sigma, with_fas_sigma = (bool(v) for v in key)
+            ix = np.flatnonzero((groups == key).all(axis=1))
             df = records.iloc[ix].reset_index(drop=True).drop(columns="event_id")
             if not with_scalars:
                 df = df.drop(columns=scalar_cols)
