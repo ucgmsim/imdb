@@ -90,6 +90,26 @@ def test_merge_adds_event_and_sites(db, tmp_path):
     assert db.get_events().loc["eventC", "domain_wkt"].startswith("POLYGON")
 
 
+def test_merge_keeps_site_values_missing_from_incoming(db, tmp_path):
+    """A NULL site value in the incoming file doesn't erase a known value here."""
+    with _single_event_db(tmp_path / "rich.duckdb") as src:
+        db.merge_from(src)
+    assert db.get_sites().loc["siteA", "vs30"] == pytest.approx(400.0)
+
+    # A later event that references siteA without a site characterisation
+    with _single_event_db(
+        tmp_path / "sparse.duckdb", event_id="eventE", site_lat=-43.8
+    ) as src:
+        src.con.raw_sql("UPDATE sites SET vs30 = NULL")
+        db.merge_from(src)
+
+    sites = db.get_sites()
+    assert sites.loc["siteA", "vs30"] == pytest.approx(400.0)
+    # Values the incoming file does have still win
+    assert sites.loc["siteA", "lat"] == pytest.approx(-43.8)
+    assert db.validate() == []
+
+
 def test_merge_replaces_existing_event(db, tmp_path):
     """Merging an event again replaces it rather than duplicating records."""
     with _single_event_db(tmp_path / "first.duckdb", pga=0.1) as src:

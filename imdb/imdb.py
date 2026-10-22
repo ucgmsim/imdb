@@ -590,9 +590,12 @@ class IMDB:
     def merge_from(self, other: "IMDB", replace: bool = True) -> list[str]:
         """Copy every event of another IMDB into this one, with everything derived from it.
 
-        Copies the events, their realisations, site-event distances, records and IMs. Sites are matched by `site_id`: new sites are added and existing
-        ones are updated with `other`'s values. Both databases must share the same period
-        (and frequency) grids, and `other`'s components must all be in this database.
+        Copies the events, their realisations, site-event distances, records and IMs.
+        Sites are matched by `site_id`: new sites are added, and existing ones take
+        `other`'s values where `other` has them. A NULL in `other` keeps this database's
+        value, since a shared site is referenced by other events here too. Both databases
+        must share the same period (and frequency) grids, and `other`'s components must
+        all be in this database.
 
         Not atomic as a whole (`add_records` commits its own transaction), so merge into a
         copy of the target and swap it in once `validate` passes.
@@ -643,7 +646,8 @@ class IMDB:
         for event_id in existing:
             self.delete_event(event_id)
 
-        # Sites: add new ones, update existing ones in place
+        # Sites: add new ones, update existing ones in place without letting a missing
+        # incoming value (NULL) erase a known one
         sites = other.get_sites().reset_index().drop(columns="site_int_id")
         sites = sites[[c for c in sites.columns if c in self._columns("sites")]]
         known = sites["site_id"].isin(self.get_sites().index)
@@ -654,7 +658,9 @@ class IMDB:
             raw = self.con.con
             raw.register("_merge_sites", sites[known])
             set_clause = ", ".join(
-                f"{c} = m.{c}" for c in sites.columns if c != "site_id"
+                f"{c} = COALESCE(m.{c}, sites.{c})"
+                for c in sites.columns
+                if c != "site_id"
             )
             try:
                 raw.execute(
