@@ -236,6 +236,21 @@ class IMDB:
         df = self.con.table(table).select(id_col, int_col).to_pandas()
         return df.set_index(id_col)[int_col]
 
+    def _columns(self, table: str) -> list[str]:
+        """The columns `table` has in this database (older schema versions lack some).
+
+        Parameters
+        ----------
+        table : str
+            Table name.
+
+        Returns
+        -------
+        list of str
+            Column names, in table order.
+        """
+        return list(self.con.table(table).columns)
+
     def add_events(self, df: pd.DataFrame) -> None:
         """Insert new events.
 
@@ -505,6 +520,205 @@ class IMDB:
         ]
         for statement in statements:
             self.con.raw_sql(statement, parameters=[event_id])
+
+    def _grid(self, table: str, index_col: str, value_col: str) -> np.ndarray:
+        """Return the period or frequency grid, in index order.
+
+        Parameters
+        ----------
+        table : str
+            `"periods"` or `"frequencies"`.
+        index_col : str
+            The grid's 1-based index column.
+        value_col : str
+            The grid's value column.
+
+        Returns
+        -------
+        np.ndarray
+            The grid values.
+        """
+        df = self.con.table(table).to_pandas().sort_values(index_col)
+        return df[value_col].to_numpy(dtype=float)
+
+    def _ims_by_record(
+        self, table: str, column: str, record_int_ids: np.ndarray, width: int
+    ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
+        """Return one array IM table (and its sigma) as matrices aligned to `record_int_ids`.
+
+        Parameters
+        ----------
+        table : str
+            `"psa_ims"` or `"fas_ims"`.
+        column : str
+            `"pSA"` or `"FAS"`.
+        record_int_ids : np.ndarray
+            Records to return rows for, in order.
+        width : int
+            Grid length (number of periods or frequencies).
+
+        Returns
+        -------
+        tuple of np.ndarray
+            `(values, sigma, has_sigma)`: `values` and `sigma` shaped
+            `(len(record_int_ids), width)` with NaN rows for records missing from the
+            table (`values` is None when no record has a row), and `has_sigma` a bool per
+            record that has a sigma array.
+        """
+        values = np.full((len(record_int_ids), width), np.nan)
+        sigma = np.full((len(record_int_ids), width), np.nan)
+        has_sigma = np.zeros(len(record_int_ids), dtype=bool)
+        rows = (
+            self.con.table(table)
+            .filter(_.record_int_id.isin(record_int_ids.tolist()))
+            .to_pandas()
+            .set_index("record_int_id")
+        )
+        if rows.empty:
+            return None, sigma, has_sigma
+        position = pd.Series(np.arange(len(record_int_ids)), index=record_int_ids)
+        for record_int_id, row in rows.iterrows():
+            ix = position.loc[record_int_id]
+            values[ix] = np.asarray(row[column], dtype=float)
+            row_sigma = row[f"{column}_sigma"]
+            if isinstance(row_sigma, list | np.ndarray) and len(row_sigma):
+                sigma[ix] = np.asarray(row_sigma, dtype=float)
+                has_sigma[ix] = True
+        return values, sigma, has_sigma
+
+    def merge_from(self, other: "IMDB", replace: bool = True) -> list[str]:
+        """Copy every event of another IMDB into this one, with everything derived from it.
+
+        Copies the events, their realisations, site-event distances, records and IMs. Sites are matched by `site_id`: new sites are added and existing
+        ones are updated with `other`'s values. Both databases must share the same period
+        (and frequency) grids, and `other`'s components must all be in this database.
+
+        Not atomic as a whole (`add_records` commits its own transaction), so merge into a
+        copy of the target and swap it in once `validate` passes.
+
+        Parameters
+        ----------
+        other : IMDB
+            An open database to copy from (read-only is fine).
+        replace : bool
+            Delete events that already exist here before copying them, by default True.
+            When False, an event that already exists is an error.
+
+        Returns
+        -------
+        list of str
+            The merged event ids.
+
+        Raises
+        ------
+        ValueError
+            If the grids or components don't match, or an event already exists here and
+            `replace` is False.
+        """
+        # The IM arrays are indexed by the grids, so they must match exactly
+        periods = other._grid("periods", "period_index", "period")
+        if not np.array_equal(periods, self._grid("periods", "period_index", "period")):
+            raise ValueError(
+                "period grids differ, can't merge pSA between these databases"
+            )
+        frequencies = other._grid("frequencies", "freq_index", "frequency")
+        if len(frequencies) and not np.array_equal(
+            frequencies, self._grid("frequencies", "freq_index", "frequency")
+        ):
+            raise ValueError(
+                "frequency grids differ, can't merge FAS between these databases"
+            )
+        unknown = set(other.db_meta["components"].split(",")) - set(
+            self.db_meta["components"].split(",")
+        )
+        if unknown:
+            raise ValueError(f"components not in this database: {sorted(unknown)}")
+
+        events = other.get_events().reset_index()
+        event_ids = events["event_id"].tolist()
+        existing = sorted(set(event_ids) & set(self.get_events().index))
+        if existing and not replace:
+            raise ValueError(f"events already in this database: {existing}")
+        for event_id in existing:
+            self.delete_event(event_id)
+
+        # Sites: add new ones, update existing ones in place
+        sites = other.get_sites().reset_index().drop(columns="site_int_id")
+        sites = sites[[c for c in sites.columns if c in self._columns("sites")]]
+        known = sites["site_id"].isin(self.get_sites().index)
+        if (~known).any():
+            self.add_sites(sites[~known])
+        if known.any():
+            # The underlying duckdb connection, to UPDATE ... FROM a DataFrame
+            raw = self.con.con
+            raw.register("_merge_sites", sites[known])
+            set_clause = ", ".join(
+                f"{c} = m.{c}" for c in sites.columns if c != "site_id"
+            )
+            try:
+                raw.execute(
+                    f"UPDATE sites SET {set_clause} FROM _merge_sites m WHERE sites.site_id = m.site_id"
+                )
+            finally:
+                raw.unregister("_merge_sites")
+
+        self.add_events(events.drop(columns="event_int_id"))
+        event_id_by_int = events.set_index("event_int_id")["event_id"]
+        realisations = other.get_realisations().reset_index()
+        realisations["event_id"] = event_id_by_int.loc[
+            realisations["event_int_id"]
+        ].to_numpy()
+        self.add_realisations(realisations.drop(columns=["rel_int_id", "event_int_id"]))
+
+        site_event = other.get_site_event(event_ids=event_ids)
+        if not site_event.empty:
+            self.add_site_event(site_event)
+
+        records = other.get_records(event_ids=event_ids)
+        if records.empty:
+            return event_ids
+        record_int_ids = records.index.to_numpy()
+        scalars = other.get_scalars(sigma=True, event_ids=event_ids)
+        has_scalars = np.isin(record_int_ids, scalars.index.to_numpy())
+        records = records.join(scalars, how="left")
+        scalar_cols = list(scalars.columns)
+        psa, psa_sigma, has_psa_sigma = other._ims_by_record(
+            "psa_ims", "pSA", record_int_ids, len(periods)
+        )
+        fas, fas_sigma, has_fas_sigma = other._ims_by_record(
+            "fas_ims", "FAS", record_int_ids, len(frequencies)
+        )
+
+        # Insert records in groups that share which IM rows they have, so each copy
+        # matches its source exactly: no empty scalars rows, no sigma on simulated records
+        groups = pd.DataFrame(
+            {
+                "scalars": has_scalars,
+                "psa_sigma": has_psa_sigma,
+                "fas_sigma": has_fas_sigma,
+            }
+        )
+        for (with_scalars, with_psa_sigma, with_fas_sigma), group in groups.groupby(
+            ["scalars", "psa_sigma", "fas_sigma"]
+        ):
+            ix = group.index.to_numpy()
+            df = records.iloc[ix].reset_index(drop=True).drop(columns="event_id")
+            if not with_scalars:
+                df = df.drop(columns=scalar_cols)
+            else:
+                sigma_cols = [c for c in scalar_cols if c.endswith("_sigma")]
+                df = df.drop(columns=[c for c in sigma_cols if df[c].isna().all()])
+            self.add_records(
+                df,
+                pSA=None if psa is None else psa[ix],
+                FAS=None if fas is None else fas[ix],
+                pSA_sigma=psa_sigma[ix] if with_psa_sigma and psa is not None else None,
+                FAS_sigma=fas_sigma[ix] if with_fas_sigma and fas is not None else None,
+            )
+        logger.info(
+            "merged %d event(s) from %s into %s", len(event_ids), other.path, self.path
+        )
+        return event_ids
 
     def validate(self) -> list[str]:
         """Check the invariants the schema itself cannot enforce: unique ids, valid FKs.
