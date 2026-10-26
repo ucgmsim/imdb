@@ -101,4 +101,6 @@ exclude = [
   '\.__repr__$',
   '\.__exit__$',
   '\.__enter__$',
+  # private helpers only need a one-line docstring
+  '\._[A-Za-z]\w*$',
 ]
