@@ -237,18 +237,7 @@ class IMDB:
         return df.set_index(id_col)[int_col]
 
     def _columns(self, table: str) -> list[str]:
-        """The columns `table` has in this database (older schema versions lack some).
-
-        Parameters
-        ----------
-        table : str
-            Table name.
-
-        Returns
-        -------
-        list of str
-            Column names, in table order.
-        """
+        """The columns `table` has in this database (older schema versions lack some)."""
         return list(self.con.table(table).columns)
 
     def add_events(self, df: pd.DataFrame) -> None:
@@ -522,22 +511,7 @@ class IMDB:
             self.con.raw_sql(statement, parameters=[event_id])
 
     def _grid(self, table: str, index_col: str, value_col: str) -> np.ndarray:
-        """Return the period or frequency grid, in index order.
-
-        Parameters
-        ----------
-        table : str
-            `"periods"` or `"frequencies"`.
-        index_col : str
-            The grid's 1-based index column.
-        value_col : str
-            The grid's value column.
-
-        Returns
-        -------
-        np.ndarray
-            The grid values.
-        """
+        """Return the period or frequency grid, in index order."""
         df = self.con.table(table).to_pandas().sort_values(index_col)
         return df[value_col].to_numpy(dtype=float)
 
