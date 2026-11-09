@@ -242,3 +242,47 @@ def test_merge_copies_mixed_kinds_exactly(tmp_path):
         assert target.get_scalars(sigma=True, kind="gmm")["PGA_sigma"].iloc[0] == (
             pytest.approx(0.6)
         )
+
+
+def test_merge_rejects_different_frequency_grid(db, tmp_path):
+    """FAS arrays can't be merged across different frequency grids."""
+    src = IMDB.create(
+        tmp_path / "src.duckdb",
+        periods=PERIODS,
+        frequencies=[2.0, 4.0],
+        components=COMPONENTS,
+    )
+    with src, pytest.raises(ValueError, match="frequency grids differ"):
+        db.merge_from(src)
+
+
+def test_merge_event_without_records(db, tmp_path):
+    """An event with realisations and site distances but no records still merges."""
+    src = IMDB.create(
+        tmp_path / "src.duckdb",
+        periods=PERIODS,
+        frequencies=FREQUENCIES,
+        components=COMPONENTS,
+    )
+    n_records = len(db.get_records())
+    with src:
+        src.add_events(pd.DataFrame({"event_id": ["eventC"], "magnitude": [5.0]}))
+        src.add_realisations(
+            pd.DataFrame({"rel_id": ["eventC_rel0"], "event_id": ["eventC"]})
+        )
+        src.add_sites(
+            pd.DataFrame({"site_id": ["siteA"], "lat": [-43.5], "lon": [172.6]})
+        )
+        src.add_site_event(
+            pd.DataFrame({"site_id": ["siteA"], "event_id": ["eventC"], "rrup": [3.0]})
+        )
+
+        assert db.merge_from(src) == ["eventC"]
+
+    assert db.get_events().loc["eventC", "magnitude"] == 5.0
+    assert "eventC_rel0" in db.get_realisations().index
+    site_event = db.get_site_event(event_ids=["eventC"])
+    assert list(site_event["rrup"]) == [3.0]
+    assert db.get_records(event_ids=["eventC"]).empty
+    assert len(db.get_records()) == n_records
+    assert db.validate() == []

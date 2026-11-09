@@ -515,3 +515,87 @@ def test_rotd_component_nulls_undefined_scalars(tmp_path):
     assert scalars["PGA"].iloc[0] == 0.5
     assert pd.isna(scalars["CAV"].iloc[0])
     db.close()
+
+
+def _set_schema_version(path, value):
+    con = ibis.duckdb.connect(path, read_only=False)
+    con.raw_sql(f"UPDATE db_meta SET value = '{value}' WHERE key = 'schema_version'")
+    con.disconnect()
+
+
+def test_create_rejects_existing_path_names_the_path(tmp_path):
+    path = tmp_path / "existing.duckdb"
+    IMDB.create(path, periods=[]).close()
+
+    with pytest.raises(FileExistsError) as excinfo:
+        IMDB.create(path, periods=[])
+    assert str(excinfo.value) == f"{path} already exists"
+
+
+def test_create_returns_writable_database(tmp_path):
+    with IMDB.create(tmp_path / "new.duckdb", periods=[]) as db:
+        assert db.read_only is False
+        db.add_events(pd.DataFrame({"event_id": ["eventZ"]}))
+        assert list(db.get_events().index) == ["eventZ"]
+
+
+def test_default_open_is_read_only(db):
+    path = db.path
+    db.close()
+
+    reader = IMDB(path)
+    assert reader.read_only is True
+    with reader, pytest.raises(Exception, match="read-only"):
+        reader.add_events(pd.DataFrame({"event_id": ["eventZ"]}))
+
+    with IMDB(path, read_only=False) as writer:
+        assert list(writer.get_events().index) == EVENTS
+
+
+def test_explicit_read_only_open_rejects_writes(db):
+    path = db.path
+    db.close()
+
+    with (
+        IMDB(path, read_only=True) as reader,
+        pytest.raises(Exception, match="read-only"),
+    ):
+        reader.con.raw_sql("DELETE FROM events")
+
+    with IMDB(path, read_only=True) as reader:
+        assert list(reader.get_events().index) == EVENTS
+
+
+def test_default_open_accepts_read_compatible_old_schema_version(db):
+    path = db.path
+    db.close()
+    _set_schema_version(path, "1")
+
+    with IMDB(path) as reopened:
+        assert reopened.db_meta["schema_version"] == "1"
+
+
+@pytest.mark.parametrize(
+    ("read_only", "version", "mode"),
+    [
+        (True, "stale", "read-only"),
+        (False, "1", "read-write"),
+        (False, "stale", "read-write"),
+    ],
+)
+def test_schema_version_mismatch_message(db, read_only, version, mode):
+    path = db.path
+    db.close()
+    _set_schema_version(path, version)
+
+    reopened = IMDB(path, read_only=read_only)
+    with pytest.raises(RuntimeError) as excinfo:
+        reopened.open()
+    assert str(excinfo.value) == (
+        f"database schema version {version!r} is not usable {mode} "
+        f"by this imdb version (schema {schema.SCHEMA_VERSION!r}); "
+        "the database needs rebuilding with a matching imdb version"
+    )
+    # The failed open leaves the connection closed
+    with pytest.raises(RuntimeError, match="not open"):
+        _ = reopened.con
