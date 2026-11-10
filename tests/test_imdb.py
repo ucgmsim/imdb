@@ -1,5 +1,8 @@
 """Basic tests: the library works for its intended, correct usage."""
 
+import datetime
+from importlib import metadata
+
 import ibis
 import numpy as np
 import pandas as pd
@@ -599,3 +602,72 @@ def test_schema_version_mismatch_message(db, read_only, version, mode):
     # The failed open leaves the connection closed
     with pytest.raises(RuntimeError, match="not open"):
         _ = reopened.con
+
+
+def _sorted_table(db, name, order_by):
+    return db.con.table(name).to_pandas().sort_values(order_by).reset_index(drop=True)
+
+
+def test_create_populates_lookup_tables(tmp_path):
+    periods = [0.01, 0.3, 3.0]
+    frequencies = [0.5, 2.0]
+    with IMDB.create(
+        tmp_path / "lookup.duckdb", periods=periods, frequencies=frequencies
+    ) as db:
+        period_table = _sorted_table(db, "periods", "period_index")
+        assert list(period_table.columns) == ["period_index", "period"]
+        assert period_table["period_index"].tolist() == [1, 2, 3]
+        assert period_table["period"].tolist() == periods
+
+        freq_table = _sorted_table(db, "frequencies", "freq_index")
+        assert list(freq_table.columns) == ["freq_index", "frequency"]
+        assert freq_table["freq_index"].tolist() == [1, 2]
+        assert freq_table["frequency"].tolist() == frequencies
+
+        units = db.con.table("im_units").to_pandas()
+        assert list(units.columns) == ["im", "unit"]
+        assert dict(zip(units["im"], units["unit"], strict=True)) == schema.IM_UNITS
+
+        notes = db.con.table("notes").to_pandas()
+        assert list(notes.columns) == ["topic", "note"]
+        assert dict(zip(notes["topic"], notes["note"], strict=True)) == schema.NOTES
+
+
+def test_create_without_frequencies_has_empty_frequency_grid(tmp_path):
+    with IMDB.create(tmp_path / "nofreq.duckdb", periods=[1.0]) as db:
+        assert db.con.table("frequencies").count().execute() == 0
+        assert db.db_meta["n_frequencies"] == "0"
+        assert db.db_meta["n_periods"] == "1"
+
+
+def test_create_db_meta_defaults(tmp_path):
+    before = datetime.datetime.now(datetime.UTC)
+    with IMDB.create(
+        tmp_path / "meta.duckdb",
+        periods=PERIODS,
+        frequencies=FREQUENCIES,
+        components=COMPONENTS,
+        db_meta={"source": "unit test"},
+    ) as db:
+        meta = db.db_meta
+    after = datetime.datetime.now(datetime.UTC)
+
+    assert set(meta) == {
+        "source",
+        "schema_version",
+        "components",
+        "n_periods",
+        "n_frequencies",
+        "created_at",
+        "imdb_version",
+    }
+    assert meta["source"] == "unit test"
+    assert meta["components"] == ",".join(COMPONENTS)
+    assert meta["n_periods"] == str(len(PERIODS))
+    assert meta["n_frequencies"] == str(len(FREQUENCIES))
+    assert meta["imdb_version"] == metadata.version("ucgmsim-imdb")
+
+    created_at = datetime.datetime.fromisoformat(meta["created_at"])
+    # created_at is a timezone-aware UTC timestamp
+    assert created_at.utcoffset() == datetime.timedelta(0)
+    assert before <= created_at <= after
