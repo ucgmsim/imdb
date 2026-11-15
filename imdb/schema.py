@@ -1,4 +1,4 @@
-"""DDL and fixed vocabulary for the IMDB schema, version 0.
+"""DDL and fixed vocabulary for the IMDB schema (version: see `SCHEMA_VERSION`).
 
 Facts only, no logic. `DDL` is the single source of truth for the schema; nothing
 else in this library composes column lists by hand.
