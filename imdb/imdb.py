@@ -374,6 +374,9 @@ class IMDB:
             )
         if "gmm_key" not in df:
             df["gmm_key"] = None
+        # An all-missing gmm_key column has float dtype; normalise to object
+        # with None so it compares against the string column in the database.
+        df["gmm_key"] = df["gmm_key"].astype(object).where(df["gmm_key"].notna(), None)
 
         unknown = set(df["component"]) - set(self.db_meta["components"].split(","))
         if unknown:
