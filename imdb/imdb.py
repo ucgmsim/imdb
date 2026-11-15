@@ -723,6 +723,38 @@ class IMDB:
             if n:
                 problems.append(f"records: {n} rows with an unknown {col}")
 
+        rel_events = self.con.table("realisations").select(
+            "rel_int_id", rel_event_int_id="event_int_id"
+        )
+        joined = records.join(rel_events, "rel_int_id")
+        n = (
+            joined.filter(joined.event_int_id != joined.rel_event_int_id)
+            .count()
+            .to_pandas()
+        )
+        if n:
+            problems.append(
+                f"records: {n} rows whose event_int_id disagrees with their realisation"
+            )
+
+        site_event = self.con.table("site_event")
+        for col in ("site_int_id", "event_int_id"):
+            n = site_event.filter(~site_event[col].isin(fks[col])).count().to_pandas()
+            if n:
+                problems.append(f"site_event: {n} rows with an unknown {col}")
+
+        n = (
+            site_event.group_by(["site_int_id", "event_int_id"])
+            .aggregate(n=site_event.count())
+            .filter(lambda t: t.n > 1)
+            .count()
+            .to_pandas()
+        )
+        if n:
+            problems.append(
+                f"site_event: {n} duplicate (site_int_id, event_int_id) keys"
+            )
+
         for table in ("psa_ims", "fas_ims", "scalars_ims"):
             t = self.con.table(table)
             n = (
