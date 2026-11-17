@@ -113,6 +113,7 @@ erDiagram
         FLOAT  AI "m/s, NULL on rotd"
         FLOAT  Ds575 "s, NULL on rotd"
         FLOAT  Ds595 "s, NULL on rotd"
+        FLOAT  MMI "intensity (1), from PGV"
     }
 ```
 
@@ -135,14 +136,20 @@ diagram above for space; see `imdb/schema.py` for the full DDL, including the
 - **Components**: `000`, `090`, `ver`, `geom`, `rotd0`, `rotd50`, `rotd100`. A
   database may hold any subset, listed in `db_meta.components`; the writer
   validates against it. `scalars_ims.CAV`, `AI`, `Ds575` and `Ds595` are NULL for
-  `rotd*` components; `PGA`, `PGV` and `PGD` are populated for every component.
+  `rotd*` components; `PGA`, `PGV`, `PGD` and `MMI` are populated for every component.
 - **Record kind**: `simulated` (physics-based simulation), `gmm` (empirical GMM
   prediction) or `observed` (recorded ground motion). `gmm_key` identifies the
   model, e.g. `"Bradley_2013"`, and is NULL unless `kind = "gmm"`.
 - **Units**: linear, physical units; log is a read-time transform (`g` for pSA/PGA,
   `cm/s` for PGV, `cm` for PGD, `m/s` for CAV/AI, `s` for Ds575/Ds595, see
-  `im_units`). Every `_sigma` column/array is the exception: ln-space total
-  standard deviation, dimensionless.
+  `im_units`). Every `_sigma` column/array except `MMI_sigma` is the exception:
+  ln-space total standard deviation, dimensionless. `MMI_sigma` is in intensity
+  units, since MMI is not lognormal.
+- **MMI** (schema version 3+): Modified Mercalli intensity, dimensionless (unit
+  `1`); don't log-transform it. Following IM_calculation v2026.11.2, it is
+  computed from each component's PGV with Worden et al. (2012) and clipped to
+  [1, 10]. Databases at schema version 1 or 2 open read-only and have no `MMI`
+  column; `get_scalars` leaves it out for them.
 - **Constraints**: `PRIMARY KEY`/`UNIQUE`/`FOREIGN KEY` appear only on the four
   dimension tables. The large tables (`site_event`, `records`, `psa_ims`,
   `fas_ims`, `scalars_ims`) have none; their logical keys are documented in

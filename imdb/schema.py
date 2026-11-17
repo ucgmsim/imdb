@@ -4,12 +4,12 @@ Facts only, no logic. `DDL` is the single source of truth for the schema; nothin
 else in this library composes column lists by hand.
 """
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 # Older `schema_version`s a database can still be opened *read-only* under,
 # besides `SCHEMA_VERSION` itself.
 # Writing (`read_only=False`) still requires an exact `SCHEMA_VERSION` match.
-READ_COMPATIBLE_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION, "1"})
+READ_COMPATIBLE_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION, "2", "1"})
 
 DDL = """
 CREATE TABLE db_meta  (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL);
@@ -112,13 +112,15 @@ CREATE TABLE scalars_ims (
     Ds575         FLOAT,
     Ds575_sigma   FLOAT,
     Ds595         FLOAT,
-    Ds595_sigma   FLOAT
+    Ds595_sigma   FLOAT,
+    MMI           FLOAT,
+    MMI_sigma     FLOAT
 );
 """
 
 COMPONENTS = ("000", "090", "ver", "geom", "rotd0", "rotd50", "rotd100", "eas")
 
-SCALAR_IMS = ("PGA", "PGV", "PGD", "CAV", "AI", "Ds575", "Ds595")
+SCALAR_IMS = ("PGA", "PGV", "PGD", "CAV", "AI", "Ds575", "Ds595", "MMI")
 
 ROTD_UNDEFINED = frozenset({"CAV", "AI", "Ds575", "Ds595"})
 
@@ -134,6 +136,7 @@ IM_UNITS = {
     "AI": "m/s",
     "Ds575": "s",
     "Ds595": "s",
+    "MMI": "1",
 }
 
 NOTES = {
@@ -167,16 +170,27 @@ NOTES = {
         "db_meta.components lists which. The writer validates against that list."
     ),
     "rotd scalars are undefined": (
-        "scalars_ims.CAV, AI, Ds575 and Ds595 are NULL for rotd* components. PGA, PGV and "
-        "PGD are populated for every component."
+        "scalars_ims.CAV, AI, Ds575 and Ds595 are NULL for rotd* components. PGA, PGV, "
+        "PGD and MMI are populated for every component."
     ),
     "units": (
         "Linear, physical units; log is a read-time transform. Every IM unit is a row in "
         "im_units. Outside the IM tables: distances km, vs30 m/s, z1p0 and z2p5 km, depths "
-        "km, angles degrees, coordinates WGS84. Every *_sigma column/array is the "
-        "exception: a ln-space (natural-log) total standard deviation, dimensionless, not "
-        "the linear physical unit of its paired IM column. Populated for kind = 'gmm', "
-        "NULL for 'simulated'/'observed'."
+        "km, angles degrees, coordinates WGS84. Every *_sigma column/array except "
+        "MMI_sigma is the exception: a ln-space (natural-log) total standard deviation, "
+        "dimensionless, not the linear physical unit of its paired IM column. MMI_sigma is "
+        "a standard deviation in intensity units (see the MMI note). Populated for "
+        "kind = 'gmm', NULL for 'simulated'/'observed'."
+    ),
+    "MMI": (
+        "scalars_ims.MMI is Modified Mercalli intensity, a dimensionless intensity scale "
+        "(unit '1'), not a physical amplitude, so don't log-transform it. Following "
+        "IM_calculation (v2026.11.2+), simulated MMI is computed from the same "
+        "component's PGV with Worden et al. (2012), clipped to [1, 10], so it is defined "
+        "for every component, rotd* included. It is NULL where the source data has none "
+        "(e.g. IMs computed before IM_calculation added MMI). MMI_sigma is in intensity "
+        "units, not ln-space, because MMI is modelled as normal, not lognormal. Databases "
+        "built before schema version 3 have no MMI or MMI_sigma columns."
     ),
     "metadata columns are JSON": (
         "events, realisations, sites and site_event each carry a metadata VARCHAR holding a "
