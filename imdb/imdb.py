@@ -1012,7 +1012,9 @@ class IMDB:
             `schema.SCALAR_IMS` that this database has a column for (databases
             from older schema versions lack some, e.g. `MMI`).
         sigma : bool
-            Also return each IM's ln-space total sigma, as `<IM>_sigma` columns.
+            Also return each IM's total sigma, as `<IM>_sigma` columns. These
+            are ln-space, except `MMI_sigma`, which is in intensity units
+            because MMI is modelled as normal, not lognormal.
         **filters
             Passed to `get_records` to select which records to return.
 
