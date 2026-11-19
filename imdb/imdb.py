@@ -752,7 +752,11 @@ class IMDB:
         sigma_cols = [
             ("psa_ims", "pSA_sigma"),
             ("fas_ims", "FAS_sigma"),
-            *[("scalars_ims", f"{im}_sigma") for im in schema.SCALAR_IMS],
+            *[
+                ("scalars_ims", f"{im}_sigma")
+                for im in schema.SCALAR_IMS
+                if f"{im}_sigma" in self._columns("scalars_ims")
+            ],
         ]
         for table, col in sigma_cols:
             joined = self.con.table(table).join(kind_by_record, "record_int_id")
@@ -1027,9 +1031,13 @@ class IMDB:
         Parameters
         ----------
         ims : list of str, optional
-            Which scalar IMs to return. Defaults to all of `schema.SCALAR_IMS`.
+            Which scalar IMs to return. Defaults to every IM in
+            `schema.SCALAR_IMS` that this database has a column for (databases
+            from older schema versions lack some, e.g. `MMI`).
         sigma : bool
-            Also return each IM's ln-space total sigma, as `<IM>_sigma` columns.
+            Also return each IM's total sigma, as `<IM>_sigma` columns. These
+            are ln-space, except `MMI_sigma`, which is in intensity units
+            because MMI is modelled as normal, not lognormal.
         **filters
             Passed to `get_records` to select which records to return.
 
@@ -1038,7 +1046,9 @@ class IMDB:
         pd.DataFrame
             Indexed by `record_int_id`, one column per requested IM.
         """
-        ims = ims or list(schema.SCALAR_IMS)
+        ims = ims or [
+            im for im in schema.SCALAR_IMS if im in self._columns("scalars_ims")
+        ]
         cols = [*ims, *([f"{im}_sigma" for im in ims] if sigma else [])]
         t = self.con.table("scalars_ims").semi_join(
             self._records(**filters).select("record_int_id"), "record_int_id"

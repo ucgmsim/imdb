@@ -626,6 +626,11 @@ def select_period_indices(
     return np.array(indices)
 
 
+# Scalar IMs an intensity_measures.h5 may lack, stored as NULL when it does.
+# IM_calculation added MMI in v2026.11.2.
+OPTIONAL_SCALAR_IMS = frozenset({"MMI"})
+
+
 def read_ims(
     h5_path: Path, content: Content = DEFAULT_CONTENT, grids: Grids = DEFAULT_GRIDS
 ) -> RealisationIMs:
@@ -664,6 +669,11 @@ def read_ims(
         raw_stations = psa_group["station"][:]
         scalars: dict[str, dict[str, np.ndarray]] = {}
         for im in schema.SCALAR_IMS:
+            # cs_nshm_2022: im-calc ran before IM_calculation v2026.11.2 added MMI,
+            # so its files have no MMI group. Store MMI as NULL rather than fail.
+            if im not in h5 and im in OPTIONAL_SCALAR_IMS:
+                scalars[im] = {}
+                continue
             if not np.array_equal(h5[im]["station"][:], raw_stations):
                 raise ValueError(f"{h5_path}: {im} lists stations in a different order from pSA")
             scalars[im] = {}
@@ -1222,6 +1232,8 @@ def build_records(rel: str, ims: RealisationIMs, content: Content = DEFAULT_CONT
     for component in content.psa_components:
         frame = {"rel_id": rel, "site_id": ims.stations, "component": component, "kind": "simulated"}
         for im, by_component in ims.scalars.items():
+            if not by_component:  # absent from the h5 (OPTIONAL_SCALAR_IMS): leave NULL
+                continue
             frame[im] = by_component.get(component, np.full(n, np.nan, dtype=np.float32))
         frames.append(pd.DataFrame(frame))
     batches: list[Batch] = []
