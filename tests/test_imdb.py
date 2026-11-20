@@ -599,3 +599,25 @@ def test_schema_version_mismatch_message(db, read_only, version, mode):
     # The failed open leaves the connection closed
     with pytest.raises(RuntimeError, match="not open"):
         _ = reopened.con
+
+
+def test_add_records_accepts_all_nan_gmm_key(db):
+    db.add_sites(pd.DataFrame({"site_id": ["siteD"], "lat": [-43.8], "lon": [172.9]}))
+    df = pd.DataFrame(
+        {
+            "rel_id": ["eventA_rel0"],
+            "site_id": ["siteD"],
+            "component": ["000"],
+            "kind": ["simulated"],
+            "gmm_key": [np.nan],
+            "PGA": [1.0],
+        }
+    )
+    db.add_records(df)
+
+    records = db.get_records(site_ids=["siteD"])
+    assert len(records) == 1
+    assert records["gmm_key"].isna().all()
+
+    with pytest.raises(ValueError, match="already exist"):
+        db.add_records(df)
