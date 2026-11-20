@@ -601,6 +601,41 @@ def test_schema_version_mismatch_message(db, read_only, version, mode):
         _ = reopened.con
 
 
+def test_validate_detects_site_event_unknown_foreign_keys(db):
+    db.con.raw_sql(
+        "INSERT INTO site_event (site_int_id, event_int_id, rrup) "
+        "VALUES (999999, 999999, 1.0)"
+    )
+    problems = db.validate()
+    assert "site_event: 1 rows with an unknown site_int_id" in problems
+    assert "site_event: 1 rows with an unknown event_int_id" in problems
+
+
+def test_validate_detects_duplicate_site_event_key(db):
+    db.con.raw_sql(
+        "INSERT INTO site_event (site_int_id, event_int_id, rrup) "
+        "SELECT site_int_id, event_int_id, 5.0 FROM site_event LIMIT 1"
+    )
+    problems = db.validate()
+    assert "site_event: 1 duplicate (site_int_id, event_int_id) keys" in problems
+
+
+def test_validate_detects_record_event_realisation_mismatch(db):
+    db.con.raw_sql(
+        "UPDATE records SET event_int_id = ("
+        "SELECT max(event_int_id) FROM events) "
+        "WHERE record_int_id = ("
+        "SELECT min(record_int_id) FROM records r JOIN realisations rl "
+        "USING (rel_int_id) WHERE rl.event_int_id <> "
+        "(SELECT max(event_int_id) FROM events))"
+    )
+    problems = db.validate()
+    assert (
+        "records: 1 rows whose event_int_id disagrees with their realisation"
+        in problems
+    )
+
+
 def test_add_records_accepts_all_nan_gmm_key(db):
     db.add_sites(pd.DataFrame({"site_id": ["siteD"], "lat": [-43.8], "lon": [172.9]}))
     df = pd.DataFrame(
