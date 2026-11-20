@@ -634,3 +634,25 @@ def test_validate_detects_record_event_realisation_mismatch(db):
         "records: 1 rows whose event_int_id disagrees with their realisation"
         in problems
     )
+
+
+def test_add_records_accepts_all_nan_gmm_key(db):
+    db.add_sites(pd.DataFrame({"site_id": ["siteD"], "lat": [-43.8], "lon": [172.9]}))
+    df = pd.DataFrame(
+        {
+            "rel_id": ["eventA_rel0"],
+            "site_id": ["siteD"],
+            "component": ["000"],
+            "kind": ["simulated"],
+            "gmm_key": [np.nan],
+            "PGA": [1.0],
+        }
+    )
+    db.add_records(df)
+
+    records = db.get_records(site_ids=["siteD"])
+    assert len(records) == 1
+    assert records["gmm_key"].isna().all()
+
+    with pytest.raises(ValueError, match="already exist"):
+        db.add_records(df)

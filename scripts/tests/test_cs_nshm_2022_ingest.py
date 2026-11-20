@@ -576,6 +576,35 @@ def test_ims_are_the_h5_values(campaign: Campaign):
         assert np.float32(scalars.loc[geom[0], "CAV"]) == cav_geom
 
 
+def test_mmi_is_null_when_im_calc_predates_it(campaign: Campaign):
+    # The fixture's h5 files have no MMI group, like im-calc before IM_calculation v2026.11.2
+    campaign.build()
+    with IMDB(campaign.out) as db:
+        counts = db.con.sql("SELECT count(*) AS n, count(MMI) AS n_mmi FROM scalars_ims").to_pandas()
+    assert counts["n"].iloc[0] > 0
+    assert counts["n_mmi"].iloc[0] == 0  # SQL NULL, not NaN (count() counts NaN)
+
+
+def test_mmi_from_im_calc_is_ingested_on_every_component(campaign: Campaign):
+    for original_id, (h5_path, _) in campaign.files.items():
+        rng = np.random.default_rng(len(original_id))
+        with h5py.File(h5_path, "r+") as h5:
+            group = h5.create_group("MMI")
+            h5.copy(h5["PGV/station"], group, "station")
+            for c in ALL_COMPONENTS:
+                group[c] = rng.uniform(1.0, 10.0, len(STATIONS[original_id]))
+    campaign.build()  # its own post-build check compares sampled MMI values with the h5
+    original_id, rel = "288271", "288271_R2"
+    station = STATIONS[original_id].index("2TfEMSL")
+    with h5py.File(campaign.h5(original_id)) as h5:
+        expected = {c: np.float32(h5[f"MMI/{c}"][station]) for c in ("geom", "rotd50")}
+    with IMDB(campaign.out) as db:
+        for component, value in expected.items():
+            ids = db.get_records(rel_ids=[rel], site_ids=["2TfEMSL"], component=component).index
+            stored = db.get_scalars(ims=["MMI"], record_int_ids=list(ids))["MMI"].iloc[0]
+            assert np.float32(stored) == value
+
+
 def test_peaks_are_logged(campaign: Campaign, capsys: pytest.CaptureFixture):
     campaign.build()
     out = capsys.readouterr().out
